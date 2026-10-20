@@ -1,0 +1,4 @@
+/.cursor/
+/docs/
+__pycache__/
+*.egg-info/

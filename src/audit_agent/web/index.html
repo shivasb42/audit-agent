@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Audit tasks</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #fff; --text: #1d2330; --muted: #677085; --line: #e3e6ec;
+    --accent: #2f6fed; --danger: #c93a3a; --ok: #2a8a55;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); }
+  header { display: flex; align-items: center; gap: 16px; padding: 12px 20px; background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 2; }
+  header h1 { font-size: 16px; margin: 0; }
+  select, input, button { font: inherit; }
+  select, input { padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: #fff; }
+  button { padding: 6px 12px; border: 1px solid var(--line); border-radius: 6px; background: #fff; cursor: pointer; }
+  button:hover { border-color: #c7ccd6; }
+  button.danger { color: #fff; background: var(--danger); border-color: var(--danger); }
+  button.ok { color: #fff; background: var(--ok); border-color: var(--ok); }
+  button:disabled { opacity: .45; cursor: default; }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 440px; gap: 16px; padding: 16px 20px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+  .counts { display: flex; gap: 8px; flex-wrap: wrap; padding: 12px 14px; border-bottom: 1px solid var(--line); }
+  .chip { padding: 2px 10px; border-radius: 999px; background: #eef1f6; color: var(--muted); font-size: 12px; cursor: pointer; border: 1px solid transparent; }
+  .chip.active { border-color: var(--accent); color: var(--accent); background: #eef4ff; }
+  .filters { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; padding: 12px 14px; border-bottom: 1px solid var(--line); }
+  .filters input[type=text] { width: 190px; }
+  .bulk { display: flex; gap: 8px; align-items: center; padding: 10px 14px; border-bottom: 1px solid var(--line); color: var(--muted); }
+  .bulk .spacer { flex: 1; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-size: 12px; color: var(--muted); font-weight: 600; background: #fafbfc; position: sticky; top: 57px; }
+  tr.row { cursor: pointer; }
+  tr.row:hover td { background: #f8faff; }
+  tr.row.selected td { background: #eef4ff; }
+  tr.row.cancelled td { color: var(--muted); }
+  tr.row.cancelled .title { text-decoration: line-through; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .reason { color: var(--muted); font-size: 12px; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; background: #eef1f6; }
+  .badge.pending { background: #eef4ff; color: var(--accent); }
+  .badge.cancelled { background: #f9eaea; color: var(--danger); }
+  .badge.done { background: #e8f5ee; color: var(--ok); }
+  .badge.test { background: #f3eefc; color: #6b46c1; margin-left: 6px; }
+  aside { padding: 14px 16px; position: sticky; top: 73px; align-self: start; max-height: calc(100vh - 90px); overflow: auto; }
+  aside h2 { font-size: 15px; margin: 0 0 4px; }
+  aside h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 16px 0 6px; }
+  aside ul { margin: 0; padding-left: 18px; }
+  aside li { margin: 2px 0; word-break: break-all; }
+  .empty { color: var(--muted); padding: 24px; text-align: center; }
+  .gaps { padding: 12px 14px; color: var(--muted); font-size: 13px; }
+  code { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
+  #toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: #1d2330; color: #fff; padding: 8px 14px; border-radius: 8px; opacity: 0; transition: opacity .2s; }
+  #toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Audit tasks</h1>
+  <select id="audit"></select>
+  <span id="repo" class="reason"></span>
+</header>
+<main>
+  <section class="panel">
+    <div class="counts" id="counts"></div>
+    <div class="filters">
+      <select id="status"><option value="">Any status</option></select>
+      <input id="folder" type="text" placeholder="Folder, e.g. scripts">
+      <select id="tests">
+        <option value="">Tests and app code</option>
+        <option value="hide">Hide test code</option>
+        <option value="only">Only test code</option>
+      </select>
+      <input id="search" type="text" placeholder="Search titles and files">
+    </div>
+    <div class="bulk">
+      <span id="selection">0 selected</span>
+      <button id="cancel-selected" disabled>Cancel selected</button>
+      <button id="restore-selected" disabled>Restore selected</button>
+      <span class="spacer"></span>
+      <span id="matching"></span>
+      <button id="cancel-matching" class="danger">Cancel all matching</button>
+      <button id="restore-matching" class="ok">Restore all matching</button>
+    </div>
+    <table>
+      <thead><tr>
+        <th><input type="checkbox" id="select-all" title="Select all shown"></th>
+        <th class="num">Priority</th><th>Task</th><th>Status</th><th class="num">Files</th><th class="num">Lines</th><th></th>
+      </tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <div class="gaps" id="gaps"></div>
+  </section>
+  <aside class="panel" id="detail"><div class="empty">Select a task to see its files and connections.</div></aside>
+</main>
+<div id="toast"></div>
+<script>
+const STATUSES = ["pending", "running", "done", "failed", "blocked", "cancelled"];
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+const state = { audit: null, tasks: [], selected: new Set(), openTask: null };
+
+async function api(path, body) {
+  const options = body === undefined ? {} : {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Audit-Agent": "1" },
+    body: JSON.stringify(body),
+  };
+  const res = await fetch(path, options);
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || res.statusText);
+  return data;
+}
+
+function toast(text) {
+  const t = $("toast");
+  t.textContent = text;
+  t.classList.add("show");
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => t.classList.remove("show"), 2200);
+}
+
+function filter() {
+  return { status: $("status").value, folder: $("folder").value.trim(), tests: $("tests").value, search: $("search").value.trim() };
+}
+
+async function loadAudits() {
+  const audits = await api("/api/audits");
+  $("audit").innerHTML = audits.map((a) => {
+    const total = Object.values(a.task_counts).reduce((x, y) => x + y, 0);
+    return `<option value="${a.id}">#${a.id} ${esc(a.repo_name)} (${total} tasks)</option>`;
+  }).join("");
+  state.audits = audits;
+  const fromHash = Number(location.hash.slice(1));
+  if (audits.some((a) => a.id === fromHash)) $("audit").value = fromHash;
+  await selectAudit();
+}
+
+async function selectAudit() {
+  state.audit = Number($("audit").value);
+  location.hash = state.audit;
+  const audit = state.audits.find((a) => a.id === state.audit);
+  $("repo").textContent = audit ? `${audit.repo_path} @ ${audit.commit}` : "";
+  state.selected.clear();
+  state.openTask = null;
+  $("detail").innerHTML = '<div class="empty">Select a task to see its files and connections.</div>';
+  await loadTasks();
+}
+
+async function loadTasks() {
+  if (!state.audit) { $("rows").innerHTML = '<tr><td colspan="7" class="empty">No audits yet. Run audit-agent start and plan first.</td></tr>'; return; }
+  const q = new URLSearchParams(Object.entries(filter()).filter(([, v]) => v));
+  const data = await api(`/api/audits/${state.audit}/tasks?${q}`);
+  state.tasks = data.tasks;
+  const shown = new Set(data.tasks.map((t) => t.id));
+  for (const id of [...state.selected]) if (!shown.has(id)) state.selected.delete(id);
+
+  $("counts").innerHTML = `<span class="chip ${filter().status ? "" : "active"}" data-status="">All ${data.total}</span>` +
+    STATUSES.map((s) => `<span class="chip ${filter().status === s ? "active" : ""}" data-status="${s}">${s} ${data.counts[s]}</span>`).join("");
+  $("matching").textContent = `${data.tasks.length} matching`;
+
+  $("rows").innerHTML = data.tasks.length ? data.tasks.map((t) => `
+    <tr class="row ${t.status} ${state.openTask === t.id ? "selected" : ""}" data-id="${t.id}">
+      <td><input type="checkbox" class="pick" data-id="${t.id}" ${state.selected.has(t.id) ? "checked" : ""}></td>
+      <td class="num">${t.priority}</td>
+      <td><div class="title">${esc(t.title)}${t.test_only ? '<span class="badge test">test</span>' : ""}</div><div class="reason">${esc(t.priority_reason)}</div></td>
+      <td><span class="badge ${t.status}">${t.status}</span></td>
+      <td class="num">${t.file_count}</td>
+      <td class="num">${t.line_count.toLocaleString()}</td>
+      <td>${t.status === "cancelled"
+          ? `<button class="act" data-action="restore" data-id="${t.id}">Restore</button>`
+          : ["pending", "blocked", "failed"].includes(t.status)
+            ? `<button class="act" data-action="cancel" data-id="${t.id}">Cancel</button>` : ""}</td>
+    </tr>`).join("") : '<tr><td colspan="7" class="empty">No tasks match these filters.</td></tr>';
+
+  $("gaps").innerHTML = data.not_covered.length
+    ? "Not covered by any task: " + data.not_covered.map((g) => `${esc(g.what)} (${g.file_count} files)`).join(", ")
+    : "Every analyzable file is covered by a task.";
+  updateSelection();
+}
+
+function updateSelection() {
+  $("selection").textContent = `${state.selected.size} selected`;
+  $("cancel-selected").disabled = $("restore-selected").disabled = state.selected.size === 0;
+  $("select-all").checked = state.tasks.length > 0 && state.tasks.every((t) => state.selected.has(t.id));
+}
+
+async function showTask(id) {
+  state.openTask = id;
+  document.querySelectorAll("tr.row").forEach((r) => r.classList.toggle("selected", Number(r.dataset.id) === id));
+  const d = await api(`/api/tasks/${id}`);
+  const list = (rows, render, limit = 40) => rows.length
+    ? `<ul>${rows.slice(0, limit).map((r) => `<li>${render(r)}</li>`).join("")}</ul>${rows.length > limit ? `<div class="reason">and ${rows.length - limit} more</div>` : ""}`
+    : '<div class="reason">none</div>';
+  $("detail").innerHTML = `
+    <h2>${esc(d.task.title)}</h2>
+    <div class="reason">Task #${d.task.id} &middot; ${d.task.status} &middot; priority ${d.task.priority} (${esc(d.task.priority_reason)})</div>
+    <h3>Files to audit (${d.files.length})</h3>${list(d.files, (f) => `<code>${esc(f.path)}</code> <span class="reason">${f.line_count} lines</span>`, 100)}
+    <h3>Entry points (${d.entry_points.length})</h3>${list(d.entry_points, (e) => `<code>${esc(e.path)}</code> <span class="reason">${esc(e.kind)}</span>`)}
+    <h3>Imports of missing files (${d.unresolved.length})</h3>${list(d.unresolved, (u) => `<code>${esc(u.path)}:${u.line}</code> ${esc(u.specifier)}`)}
+    <h3>Imports from elsewhere (${d.imports.length})</h3>${list(d.imports, (r) => `<code>${esc(r.path)}</code>`)}
+    <h3>Imported by (${d.imported_by.length})</h3>${list(d.imported_by, (r) => `<code>${esc(r.path)}</code>`)}
+    <h3>Packages (${d.packages.length})</h3>${list(d.packages, (p) => `${esc(p.name)} <span class="reason">${p.uses}</span>`)}
+    <h3>API calls made here (${d.api_calls.length})</h3>${list(d.api_calls, (c) => {
+      const where = `<code>${esc(c.method)} ${esc(c.url)}</code> <span class="reason">${esc(c.path)}:${c.line}</span>`;
+      if (c.status === "matched") return `${where} &rarr; <code>${esc(c.route_repo)}: ${esc(c.handler_path)}</code>`;
+      if (c.status === "wrong_method") return `${where} <strong style="color:var(--danger)">wrong method</strong> <span class="reason">route is ${esc(c.route_method)} ${esc(c.route_path)}</span>`;
+      return `${where} <strong style="color:var(--danger)">${esc(c.status)}</strong>`;
+    })}
+    <h3>API routes handled here (${d.api_routes.length})</h3>${list(d.api_routes, (r) => `<code>${esc(r.method)} ${esc(r.path)}</code> <span class="reason">${r.callers} callers</span>`)}`;
+}
+
+async function change(action, ids) {
+  const res = await api(`/api/tasks/${action}`, { ids });
+  toast(`${action === "cancel" ? "Cancelled" : "Restored"} ${res.changed} task${res.changed === 1 ? "" : "s"}`);
+  await refresh();
+}
+
+async function changeMatching(action) {
+  const count = state.tasks.length;
+  if (!count) return;
+  const verb = action === "cancel" ? "Cancel" : "Restore";
+  if (!confirm(`${verb} all ${count} tasks matching the current filters?`)) return;
+  const res = await api(`/api/audits/${state.audit}/${action}`, { filter: filter() });
+  toast(`${verb}${action === "cancel" ? "led" : "d"} ${res.changed} task${res.changed === 1 ? "" : "s"}`);
+  await refresh();
+}
+
+async function refresh() {
+  await loadTasks();
+  const audits = await api("/api/audits");
+  state.audits = audits;
+  if (state.openTask) await showTask(state.openTask);
+}
+
+$("audit").addEventListener("change", selectAudit);
+let typing;
+for (const id of ["folder", "search"]) $(id).addEventListener("input", () => { clearTimeout(typing); typing = setTimeout(loadTasks, 200); });
+for (const id of ["status", "tests"]) $(id).addEventListener("change", loadTasks);
+$("status").innerHTML += STATUSES.map((s) => `<option value="${s}">${s}</option>`).join("");
+$("counts").addEventListener("click", (e) => {
+  const chip = e.target.closest(".chip");
+  if (!chip) return;
+  $("status").value = chip.dataset.status;
+  loadTasks();
+});
+$("rows").addEventListener("click", (e) => {
+  const pick = e.target.closest(".pick");
+  if (pick) {
+    const id = Number(pick.dataset.id);
+    pick.checked ? state.selected.add(id) : state.selected.delete(id);
+    return updateSelection();
+  }
+  const act = e.target.closest(".act");
+  if (act) return change(act.dataset.action, [Number(act.dataset.id)]);
+  const row = e.target.closest("tr.row");
+  if (row) showTask(Number(row.dataset.id));
+});
+$("select-all").addEventListener("change", (e) => {
+  state.tasks.forEach((t) => e.target.checked ? state.selected.add(t.id) : state.selected.delete(t.id));
+  loadTasks();
+});
+$("cancel-selected").addEventListener("click", () => change("cancel", [...state.selected]));
+$("restore-selected").addEventListener("click", () => change("restore", [...state.selected]));
+$("cancel-matching").addEventListener("click", () => changeMatching("cancel"));
+$("restore-matching").addEventListener("click", () => changeMatching("restore"));
+
+loadAudits().catch((err) => { $("rows").innerHTML = `<tr><td colspan="7" class="empty">${esc(err.message)}</td></tr>`; });
+</script>
+</body>
+</html>

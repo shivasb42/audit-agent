@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autonomous-code-audit"
+version = "0.1.0"
+description = "Locally run, database-backed code auditing with Claude Code agents."
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+audit-agent = "audit_agent.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+audit_agent = ["web/*.html"]
