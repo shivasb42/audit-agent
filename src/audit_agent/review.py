@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from audit_agent import store
-from audit_agent.planning import is_test_path
+from audit_agent.inventory.languages import is_test_path
 
 CANCELLABLE_STATUSES = ("pending", "blocked", "failed")
 TEST_FILTERS = ("only", "hide")
@@ -20,6 +20,7 @@ class TaskFilter:
     folder: str | None = None
     tests: str | None = None
     search: str | None = None
+    app: str | None = None
 
     def __post_init__(self) -> None:
         if self.status and self.status not in store.TASK_STATUSES:
@@ -37,7 +38,24 @@ def _task_files(conn: sqlite3.Connection, audit_id: int) -> dict[int, list[str]]
     return files
 
 
+def task_apps(conn: sqlite3.Connection, audit_id: int) -> dict[int, str | None]:
+    """The app root each task belongs to: the app holding most of its files (planning keeps a
+    task's files inside one package, so in practice all of them). None for audits without apps."""
+    best: dict[int, tuple[int, str | None]] = {}
+    for row in conn.execute(
+        """SELECT tf.task_id, f.app_root, COUNT(*) AS n FROM audit_task_files tf
+           JOIN inventory_files f ON f.audit_id = tf.audit_id AND f.path = tf.path
+           WHERE tf.audit_id = ? GROUP BY tf.task_id, f.app_root""",
+        (audit_id,),
+    ):
+        if row["task_id"] not in best or row["n"] > best[row["task_id"]][0]:
+            best[row["task_id"]] = (row["n"], row["app_root"])
+    return {task_id: root for task_id, (_, root) in best.items()}
+
+
 def _matches(task: dict, files: list[str], f: TaskFilter) -> bool:
+    if f.app and task["app_root"] != f.app:
+        return False
     if f.status and task["status"] != f.status:
         return False
     if f.folder:
@@ -60,11 +78,13 @@ def find_tasks(conn: sqlite3.Connection, audit_id: int, f: TaskFilter = TaskFilt
     """Tasks matching the filter, highest priority first, each with its files and a test-only flag."""
     store.get_audit(conn, audit_id)
     files = _task_files(conn, audit_id)
+    apps = task_apps(conn, audit_id)
     found = []
     for row in store.list_tasks(conn, audit_id):
         task = dict(row)
         task_paths = files.get(task["id"], [])
         task["files"] = task_paths
+        task["app_root"] = apps.get(task["id"])
         task["test_only"] = bool(task_paths) and all(is_test_path(p) for p in task_paths)
         if _matches(task, task_paths, f):
             found.append(task)

@@ -1,15 +1,17 @@
-"""Run a Claude Code agent on one audit task and save what it finds.
+"""Run a Claude agent on one audit task and save what it finds.
 
-The agent runs through the `claude` CLI in print mode, inside the task's repository, with
-read-only tools only. Its answer is validated before anything is saved: a finding must cite a
-file and line that exist and quote code that is actually there; otherwise it is downgraded to
-"needs review" or rejected.
+The agent runs either through the Anthropic API (see api_runner) or through the `claude` CLI in
+print mode, inside the task's repository, with read-only tools only. Its answer is validated
+before anything is saved: a finding must cite a file and line that exist and quote code that is
+actually there; otherwise it is downgraded to "needs review" or rejected.
 """
+
+from __future__ import annotations
+
 
 from typing import Literal
 
 
-from __future__ import annotations
 
 import json
 import os
@@ -92,6 +94,9 @@ class InvestigationError(Exception):
     pass
 
 
+RUNNERS = ("auto", "api", "cli")
+
+
 @dataclass
 class AgentSettings:
     executable: str = "claude"
@@ -99,6 +104,7 @@ class AgentSettings:
     max_turns: int = 40
     timeout_s: int = 900
     max_budget_usd: float | None = None
+    runner: str = "auto"
 
 
 @dataclass
@@ -121,7 +127,8 @@ def find_claude(settings: AgentSettings) -> str:
     if not resolved:
         raise InvestigationError(
             "The `claude` command was not found. Install Claude Code (npm install -g @anthropic-ai/claude-code), "
-            "run `claude` once to log in, or point AUDIT_AGENT_CLAUDE at it."
+            "run `claude` once to log in, or point AUDIT_AGENT_CLAUDE at it. "
+            "Or save an Anthropic API key with `audit-agent set-api-key` to call the API directly."
         )
     return resolved
 
@@ -372,6 +379,23 @@ def _repo_state(root: Path) -> str:
     return f"{repo.head_commit}\n{status}"
 
 
+def choose_runner(settings: AgentSettings):
+    """Pick how to call Claude: the Anthropic API with a saved key, or the Claude Code CLI.
+    `auto` uses the API when a key is available and the CLI otherwise."""
+    from audit_agent import api_runner, credentials
+
+    if settings.runner not in RUNNERS:
+        raise InvestigationError(f"Unknown runner {settings.runner!r}; use one of {', '.join(RUNNERS)}.")
+    key = credentials.get_api_key()
+    if settings.runner == "api" or (settings.runner == "auto" and key):
+        if not key:
+            raise InvestigationError(
+                "No Anthropic API key found. Save one with `audit-agent set-api-key` or set ANTHROPIC_API_KEY."
+            )
+        return lambda prompt, root, s, secrets, dirs: api_runner.run_api(prompt, root, s, secrets, dirs, key)
+    return run_claude
+
+
 def investigate(conn: sqlite3.Connection, task_id: int, settings: AgentSettings | None = None, again: bool = False) -> dict:
     settings = settings or AgentSettings()
     task = store.get_task(conn, task_id)
@@ -400,10 +424,12 @@ def investigate(conn: sqlite3.Connection, task_id: int, settings: AgentSettings 
     own_secrets = {r["path"] for r in secret_rows if r["audit_id"] == audit["id"]}
 
     prompt = build_prompt(conn, task, audit, sorted(own_secrets))
+    extra_dirs = [p for p in roots.values() if p != root]
+    run_with = choose_runner(settings)
     before = _repo_state(root)
     run_id = store.start_run(conn, task_id, GENERAL_AGENT)
     try:
-        result = run_claude(prompt, root, settings, secret_paths, [p for n, p in roots.items() if p != root])
+        result = run_with(prompt, root, settings, secret_paths, extra_dirs)
     except InvestigationError as exc:
         store.finish_run(conn, run_id, task_id, "failed", error=str(exc))
         raise

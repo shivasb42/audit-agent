@@ -2,19 +2,71 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
+from collections import Counter
 
-from audit_agent import store
+from audit_agent import review, store
 
 SECTION_COLUMNS = {
-    "files": ["path", "category", "language", "supported", "line_count", "size_bytes", "note"],
+    "files": ["path", "app_root", "category", "language", "supported", "line_count", "size_bytes", "note"],
     "modules": ["path", "package_root", "languages", "file_count", "line_count"],
     "dependencies": ["manifest_path", "ecosystem", "name", "version_spec", "scope"],
     "entry-points": ["kind", "path", "source_path", "detail"],
     "relationships": ["source_path", "line", "kind", "specifier", "target_path", "target_package"],
     "unsupported": ["technology", "kind", "file_count", "evidence_path", "reason"],
     "skipped": ["reason", "file_count", "example_path"],
+    "apps": ["root", "app_type", "type_source", "detected_type", "also_targets", "file_count", "manifests", "evidence"],
 }
+
+TYPE_LABELS = {"backend": "Backend", "web": "Web", "mobile": "Mobile", "unknown": "Unknown"}
+
+
+def app_rows(conn: sqlite3.Connection, audit_ids: list[int]) -> list[dict]:
+    return [
+        {
+            "name": store.app_name(r["repo_name"], r["root"]),
+            "path": store.app_path(r["repo_path"], r["root"]),
+            "audit_id": r["audit_id"],
+            "root": r["root"],
+            "type": r["app_type"],
+            "detected_type": r["detected_type"],
+            "type_source": r["type_source"],
+            "also_targets": [t for t in r["also_targets"].split(",") if t],
+            "source_files": r["file_count"],
+            "manifests": json.loads(r["manifests"]),
+            "evidence": json.loads(r["evidence"]),
+        }
+        for r in store.list_apps(conn, audit_ids)
+    ]
+
+
+def format_apps(rows: list[dict]) -> str:
+    if not rows:
+        return "Apps: none found"
+    width = max(len(r["name"]) for r in rows)
+    lines = [f"Apps ({len(rows)}):"]
+    for r in rows:
+        label = TYPE_LABELS[r["type"]]
+        if r["also_targets"]:
+            label += f", also targets {', '.join(r['also_targets'])}"
+        if r["type_source"] == "engineer":
+            label += f" (set by you; detected as {r['detected_type']})"
+        elif r["type"] == "unknown":
+            tied = any(e["strength"] == "strong" for e in r["evidence"])
+            label += " (the evidence is tied)" if tied else " (no strong signal)"
+        lines.append(f"  {r['name']:<{width}}  {label}  [{r['source_files']} source files]")
+        order = [r["detected_type"]] + [t for t in TYPE_LABELS if t != r["detected_type"]]
+        for app_type in order:
+            items = [e for e in r["evidence"] if e["type"] == app_type]
+            if items:
+                signals = [e["signal"] + ("" if e["strength"] == "strong" else " (supporting)") for e in items]
+                lines.append(f"  {'':<{width}}    {app_type}: " + "; ".join(signals))
+        if not r["evidence"]:
+            manifests = ", ".join(r["manifests"]) or "no manifest"
+            lines.append(f"  {'':<{width}}    no backend, web, or mobile signals ({manifests})")
+    lines.append("\nCorrect a type with: audit-agent app-type <app> backend|web|mobile|unknown")
+    return "\n".join(lines)
 
 
 def _counts(conn: sqlite3.Connection, sql: str, audit_id: int) -> list[sqlite3.Row]:
@@ -171,11 +223,165 @@ def format_task_list(conn: sqlite3.Connection, audit_id: int, rows: list[dict]) 
 
 
 def task_detail(conn: sqlite3.Connection, task_id: int) -> dict:
+    task = store.get_task(conn, task_id)
+    context = {name: [dict(r) for r in rows] for name, rows in store.task_context(conn, task_id).items()}
+    for call in context["api_calls"]:
+        call["route_app"] = store.app_name(call["route_repo"], call["route_app_root"] or ".") if call["route_repo"] else None
+    root = review.task_apps(conn, task["audit_id"]).get(task_id)
+    apps = {a["root"]: a for a in app_rows(conn, [task["audit_id"]])}
+    app = apps.get(root)
     return {
-        "task": dict(store.get_task(conn, task_id)),
-        **{name: [dict(r) for r in rows] for name, rows in store.task_context(conn, task_id).items()},
+        "task": dict(task),
+        "app": {"name": app["name"], "type": app["type"]} if app else None,
+        **context,
         "findings": [dict(r) for r in store.list_findings(conn, task_id=task_id)],
         "runs": [dict(r) for r in store.task_runs(conn, task_id)],
+    }
+
+
+def _audit_apps(conn: sqlite3.Connection, audit: sqlite3.Row) -> list[dict]:
+    """An audit's apps with task counts by status. An audit made before apps were detected
+    shows as one app of unknown type covering all its tasks."""
+    apps = app_rows(conn, [audit["id"]])
+    if not apps:
+        apps = [{"name": audit["repo_name"], "path": audit["repo_path"], "audit_id": audit["id"], "root": None,
+                 "type": "unknown", "detected_type": "unknown", "type_source": "detected", "also_targets": [],
+                 "source_files": None, "manifests": [], "evidence": [], "not_detected": True}]
+    task_root = review.task_apps(conn, audit["id"])
+    counts: dict[str | None, dict[str, int]] = {}
+    for task in store.list_tasks(conn, audit["id"]):
+        root = task_root.get(task["id"]) if apps[0]["root"] is not None else None
+        bucket = counts.setdefault(root, {s: 0 for s in store.TASK_STATUSES})
+        bucket[task["status"]] += 1
+    for app in apps:
+        app["task_counts"] = counts.get(app["root"], {s: 0 for s in store.TASK_STATUSES})
+        app["repo_name"] = audit["repo_name"]
+    return apps
+
+
+def project_overview(conn: sqlite3.Connection) -> list[dict]:
+    """Every project with its apps, newest first, then the audits that belong to no project."""
+    groups = []
+    grouped: set[int] = set()
+    for project in reversed(store.list_projects(conn)):
+        audits = store.project_audits(conn, project["id"])
+        grouped.update(a["id"] for a in audits)
+        groups.append({
+            "id": project["id"], "name": project["name"], "root_path": project["root_path"],
+            "api_mapped_at": project["api_mapped_at"],
+            "apps": [app for audit in audits for app in _audit_apps(conn, audit)],
+        })
+    loose = [a for a in store.list_audits(conn) if a["id"] not in grouped]
+    if loose:
+        groups.append({"id": None, "name": "Audits not in a project", "root_path": None, "api_mapped_at": None,
+                       "apps": [app for audit in loose for app in _audit_apps(conn, audit)]})
+    return groups
+
+
+def _closest_route(pattern: str | None, method: str, routes: list[dict]) -> dict | None:
+    """The route sharing the longest leading path with the call (a route parameter matches any
+    segment; the project's common prefix such as /api may be missing from the call). Ties prefer
+    literal matches, then the call's method, then a similar length. A shared common prefix alone
+    is not enough, so unrelated calls get no closest route."""
+    if not pattern:
+        return None
+    paths = {id(r): [s for s in r["pattern"].split("/") if s] for r in routes}
+    firsts = Counter(segs[0] for segs in paths.values() if segs)
+    common = {s for s, n in firsts.items() if n >= 5 and n / max(1, len(routes)) >= 0.3}
+    call = [s for s in pattern.split("/") if s]
+    candidates = [call] + [[c] + call for c in common if not call or call[0] != c]
+    best, best_score = None, None
+    for route in routes:
+        route_segs = paths[id(route)]
+        for segs in candidates:
+            shared = literal = 0
+            for c, r in zip(segs, route_segs):
+                if c != r and r != ":":
+                    break
+                shared += 1
+                literal += c == r
+            meaningful = shared - (1 if segs and segs[0] in common else 0)
+            score = (shared, literal, route["method"] == method, -abs(len(segs) - len(route_segs)))
+            if meaningful >= 1 and (best_score is None or score > best_score):
+                best, best_score = route, score
+    return best
+
+
+def api_map_view(conn: sqlite3.Connection, project_id: int) -> dict:
+    """A project's API map by app: links between apps, calls that reach no route, every route with
+    the frontend files that call it, and routes only mentioned or not referenced at all."""
+    project = store.get_project(conn, project_id)
+    audit_ids = [a["id"] for a in store.project_audits(conn, project_id)]
+    known = {(a["audit_id"], a["root"]): a for a in app_rows(conn, audit_ids)}
+
+    def app(audit_id: int, repo_name: str, root: str | None) -> dict:
+        found = known.get((audit_id, root))
+        return {"name": found["name"], "type": found["type"]} if found else {"name": repo_name, "type": "unknown"}
+
+    routes: dict[int, dict] = {}
+    for r in conn.execute(
+        """SELECT r.id, r.audit_id, r.method, r.path, r.pattern, r.file_path, r.line, r.handler_path, a.repo_name,
+                  f.app_root
+           FROM api_routes r JOIN audits a ON a.id = r.audit_id
+           LEFT JOIN inventory_files f ON f.audit_id = r.audit_id AND f.path = r.file_path
+           WHERE r.project_id = ? ORDER BY r.path, r.method""",
+        (project_id,),
+    ):
+        routes[r["id"]] = {
+            "id": r["id"], "method": r["method"], "path": r["path"], "pattern": r["pattern"],
+            "file_path": r["file_path"], "line": r["line"], "handler_path": r["handler_path"],
+            "app": app(r["audit_id"], r["repo_name"], r["app_root"]), "callers": [],
+        }
+
+    counts = {s: 0 for s in store.API_CALL_STATUSES}
+    links: dict[tuple, int] = {}
+    problems = []
+    for c in conn.execute(
+        """SELECT c.audit_id, c.source_path, c.line, c.method, COALESCE(c.pattern, c.raw) AS url, c.pattern,
+                  c.status, c.via, c.route_id, a.repo_name, f.app_root
+           FROM api_calls c JOIN audits a ON a.id = c.audit_id
+           LEFT JOIN inventory_files f ON f.audit_id = c.audit_id AND f.path = c.source_path
+           WHERE c.project_id = ? ORDER BY a.repo_name, c.source_path, c.line""",
+        (project_id,),
+    ):
+        counts[c["status"]] += 1
+        caller = app(c["audit_id"], c["repo_name"], c["app_root"])
+        route = routes.get(c["route_id"])
+        if c["status"] == "matched" and route:
+            route["callers"].append({"app": caller["name"], "path": c["source_path"], "line": c["line"]})
+            key = (caller["name"], caller["type"], route["app"]["name"], route["app"]["type"])
+            links[key] = links.get(key, 0) + 1
+        elif c["status"] in ("broken", "wrong_method"):
+            closest = route or _closest_route(c["pattern"], c["method"], list(routes.values()))
+            problems.append({
+                "app": caller["name"], "app_type": caller["type"], "path": c["source_path"], "line": c["line"],
+                "method": c["method"], "url": c["url"], "status": c["status"], "via": c["via"],
+                "closest": {"method": closest["method"], "path": closest["path"], "app": closest["app"]["name"]}
+                if closest else None,
+            })
+
+    mentioned = []
+    for m in conn.execute(
+        """SELECT m.route_id, m.audit_id, m.source_path, m.line, m.text, a.repo_name, f.app_root
+           FROM api_mentions m JOIN audits a ON a.id = m.audit_id
+           LEFT JOIN inventory_files f ON f.audit_id = m.audit_id AND f.path = m.source_path
+           WHERE m.project_id = ? ORDER BY m.source_path, m.line""",
+        (project_id,),
+    ):
+        route = routes[m["route_id"]]
+        mentioned.append({"method": route["method"], "path": route["path"], "route_app": route["app"]["name"],
+                          "app": app(m["audit_id"], m["repo_name"], m["app_root"])["name"],
+                          "file": m["source_path"], "line": m["line"], "text": m["text"]})
+    unused_ids = {r["id"] for r in store.unused_api_routes(conn, project_id)}
+    return {
+        "project": {"id": project["id"], "name": project["name"], "api_mapped_at": project["api_mapped_at"]},
+        "counts": counts,
+        "links": [{"from": f, "from_type": ft, "to": t, "to_type": tt, "calls": n}
+                  for (f, ft, t, tt), n in sorted(links.items(), key=lambda item: -item[1])],
+        "problems": problems,
+        "routes": list(routes.values()),
+        "mentioned": mentioned,
+        "unused": [routes[i] for i in routes if i in unused_ids],
     }
 
 
@@ -299,9 +505,11 @@ def format_api_summary(conn: sqlite3.Connection, project_id: int) -> str:
             (project_id,),
         ).fetchall()
     )
+    apps = app_rows(conn, [a["id"] for a in audits])
     lines = [
         f"Project #{project['id']}: {project['name']}",
         "Audits: " + ", ".join(f"#{a['id']} {a['repo_name']}" for a in audits),
+        *(["Apps: " + ", ".join(f"{a['name']} ({TYPE_LABELS[a['type']]})" for a in apps)] if apps else []),
         f"API map built: {project['api_mapped_at'] or 'not yet'}",
         "",
         f"Backend routes: {routes}  ({mentioned} only mentioned in frontend code, "
@@ -313,7 +521,7 @@ def format_api_summary(conn: sqlite3.Connection, project_id: int) -> str:
         "wrong_method": "path exists, but not with this HTTP method",
         "broken": "no route with this path",
         "unresolved": "URL built at runtime, can't be matched",
-        "external": "calls to other services",
+        "external": "calls to other services, including every call a backend app makes",
     }
     lines += [f"  {counts.get(s, 0):>5}  {labels[s]}" for s in store.API_CALL_STATUSES]
     problems = [dict(r) for r in store.api_calls(conn, project_id) if r["status"] in ("broken", "wrong_method")]

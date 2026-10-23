@@ -1,4 +1,10 @@
+import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+# Tests never call the Anthropic API or read a real saved key. Subprocesses inherit this.
+os.environ["AUDIT_AGENT_OFFLINE"] = "1"
+os.environ["AUDIT_AGENT_CREDENTIALS"] = str(Path(__file__).resolve().parent / "no-such-credentials-file")
+os.environ.pop("ANTHROPIC_API_KEY", None)

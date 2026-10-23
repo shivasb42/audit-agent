@@ -8,24 +8,17 @@ from __future__ import annotations
 
 import math
 import posixpath
-import re
 import sqlite3
 from collections import defaultdict
 from dataclasses import dataclass, field
 
 from audit_agent import store
+from audit_agent.inventory.languages import is_test_path
 
 MAX_TASK_LINES = 1500
 SMALL_CHUNK_LINES = 400
 PLANNABLE_STATUSES = ("inventoried",)
 TEST_ENTRY_KINDS = frozenset({"dart-test"})
-_TEST_DIRS = frozenset({"test", "tests", "__tests__", "integration_test", "test_driver", "e2e"})
-_TEST_NAME = re.compile(r"(\.|_)(test|spec)\.[^.]+$|^test_[^/]+\.py$")
-
-
-def is_test_path(path: str) -> bool:
-    parts = path.split("/")
-    return any(p in _TEST_DIRS for p in parts[:-1]) or bool(_TEST_NAME.search(parts[-1]))
 
 
 @dataclass

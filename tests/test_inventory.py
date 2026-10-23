@@ -282,6 +282,9 @@ class InventoryTest(unittest.TestCase):
             """CREATE TABLE audits (id INTEGER PRIMARY KEY, repo_path TEXT NOT NULL, repo_name TEXT NOT NULL,
                    head_commit TEXT, branch TEXT, working_tree_dirty INTEGER NOT NULL, status TEXT NOT NULL,
                    error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+               CREATE TABLE inventory_files (audit_id INTEGER NOT NULL, path TEXT NOT NULL, category TEXT NOT NULL,
+                   language TEXT, supported INTEGER NOT NULL, size_bytes INTEGER NOT NULL, line_count INTEGER,
+                   module_path TEXT, note TEXT, PRIMARY KEY (audit_id, path));
                INSERT INTO audits VALUES (1, '/r', 'r', NULL, 'main', 0, 'inventoried', NULL, 't', 't');
                PRAGMA user_version = 1;"""
         )

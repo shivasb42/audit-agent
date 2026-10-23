@@ -84,7 +84,8 @@ class ReviewTest(ReviewTestCase):
     def test_version_3_database_is_upgraded_without_losing_tasks(self):
         old_path = self.base / "v3.db"
         v3_schema = (
-            store.SCHEMA.replace(store.FINDING_TABLES, "")
+            store.SCHEMA.replace(store.APP_TABLES, "")
+            .replace(store.FINDING_TABLES, "")
             .replace(store.API_TRACE_TABLES, "")
             .replace(store.API_TABLES, "")
             .replace(", 'cancelled')", ")")
@@ -134,7 +135,13 @@ class ReviewPageTest(ReviewTestCase):
     def test_page_and_task_queue_are_served(self):
         status, page = self.request("GET", "/")
         self.assertEqual(status, 200)
-        self.assertIn(b"Audit tasks", page)
+        self.assertIn(b"Audit review", page)
+
+        status, data = self.request("GET", "/api/projects")
+        groups = json.loads(data)
+        self.assertEqual([g["name"] for g in groups], ["Audits not in a project"])
+        self.assertEqual([(a["name"], a["type"]) for a in groups[0]["apps"]], [("repo", "mobile")])
+        self.assertEqual(sum(groups[0]["apps"][0]["task_counts"].values()), len(self.tasks))
 
         status, data = self.request("GET", f"/api/audits/{self.audit_id}/tasks?tests=hide")
         self.assertEqual(status, 200)

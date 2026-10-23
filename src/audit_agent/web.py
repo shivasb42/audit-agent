@@ -1,4 +1,5 @@
-"""Local review page: `audit-agent ui` serves the task queue on 127.0.0.1 only.
+"""Local review page: `audit-agent ui` serves projects, their apps and task queues, and each
+project's API map on 127.0.0.1 only. Everything shown is read from the audit database.
 
 Write requests must send the `X-Audit-Agent` header and a JSON body. Browsers will not send a
 custom header cross-origin without a CORS preflight, which this server never approves, so other
@@ -37,7 +38,7 @@ def _filter_from(params: dict) -> review.TaskFilter:
         return value or None
 
     try:
-        return review.TaskFilter(one("status"), one("folder"), one("tests"), one("search"))
+        return review.TaskFilter(one("status"), one("folder"), one("tests"), one("search"), one("app"))
     except ValueError as exc:
         raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
 
@@ -72,7 +73,7 @@ def _audits(conn: sqlite3.Connection) -> list[dict]:
 
 def _audit_tasks(conn: sqlite3.Connection, audit_id: int, params: dict) -> dict:
     tasks = review.find_tasks(conn, audit_id, _filter_from(params))
-    everything = review.find_tasks(conn, audit_id)
+    everything = review.find_tasks(conn, audit_id, review.TaskFilter(app=_filter_from(params).app))
     counts = {s: 0 for s in store.TASK_STATUSES}
     for task in everything:
         counts[task["status"]] += 1
@@ -81,7 +82,8 @@ def _audit_tasks(conn: sqlite3.Connection, audit_id: int, params: dict) -> dict:
         "total": len(everything),
         "counts": counts,
         "tasks": [
-            {k: t[k] for k in ("id", "title", "status", "priority", "priority_reason", "line_count", "file_count", "test_only")}
+            {k: t[k] for k in ("id", "title", "status", "priority", "priority_reason", "line_count", "file_count",
+                               "test_only", "app_root")}
             for t in tasks
         ],
         "not_covered": [dict(r) for r in store.not_covered(conn, audit_id)],
@@ -89,6 +91,8 @@ def _audit_tasks(conn: sqlite3.Connection, audit_id: int, params: dict) -> dict:
 
 
 ROUTES_GET = [
+    (re.compile(r"^/api/projects$"), lambda conn, m, q: views.project_overview(conn)),
+    (re.compile(r"^/api/projects/(\d+)/api-map$"), lambda conn, m, q: views.api_map_view(conn, int(m[1]))),
     (re.compile(r"^/api/audits$"), lambda conn, m, q: _audits(conn)),
     (re.compile(r"^/api/audits/(\d+)/tasks$"), lambda conn, m, q: _audit_tasks(conn, int(m[1]), q)),
     (re.compile(r"^/api/tasks/(\d+)$"), lambda conn, m, q: views.task_detail(conn, int(m[1]))),

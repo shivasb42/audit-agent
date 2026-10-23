@@ -5,6 +5,10 @@ Routes come from Express (`router.get(...)`, `router.route(...).post(...)`, moun
 Calls come from verb-named helpers and methods (`getRequest('/x')`, `postAction("/x")`,
 `api.get("/x")`), method-first helpers (`apiRequest("GET", "/x")`), and `fetch("/x")`.
 
+Calls are frontend calls when they come from web and mobile apps. A backend app's own HTTP calls
+go to other services, so they are recorded as external and never matched to the project's routes.
+Files in apps of unknown type, or in audits without app types, are treated as possible frontends.
+
 Everything is read from the files on disk for each audit's inventory; no AI is involved.
 """
 
@@ -20,7 +24,7 @@ from pathlib import Path
 
 from audit_agent import api_trace, store
 from audit_agent.inventory.imports import _js_relationship, strip_js_comments
-from audit_agent.planning import is_test_path
+from audit_agent.inventory.languages import is_test_path
 
 VERBS = ("get", "post", "put", "patch", "delete")
 JS_LANGUAGES = ("JavaScript", "TypeScript")
@@ -389,7 +393,7 @@ def match_calls(calls: list[Call], routes: list[Route]) -> None:
             continue
         (wildcard if segs and segs[-1] == "*" else by_length[len(segs)]).append(route)
     for call in calls:
-        if call.pattern is None:
+        if call.pattern is None or call.status == "external":
             continue
         candidates = [call.pattern] + [p + call.pattern for p in prefixes if not call.pattern.startswith(p + "/")]
         best: tuple[float, Route] | None = None
@@ -422,11 +426,13 @@ def scan_project(conn: sqlite3.Connection, project_id: int) -> tuple[list[Route]
     for audit in store.project_audits(conn, project_id):
         root = Path(audit["repo_path"])
         files = conn.execute(
-            """SELECT path, language FROM inventory_files
-               WHERE audit_id = ? AND category = 'source' AND supported = 1 AND line_count IS NOT NULL""",
+            """SELECT f.path, f.language, ap.app_type FROM inventory_files f
+               LEFT JOIN inventory_apps ap ON ap.audit_id = f.audit_id AND ap.root = f.app_root
+               WHERE f.audit_id = ? AND f.category = 'source' AND f.supported = 1 AND f.line_count IS NOT NULL""",
             (audit["id"],),
         ).fetchall()
         file_set = {f["path"] for f in files}
+        backend = {f["path"] for f in files if f["app_type"] == "backend"}
         routers: dict[str, _RouterFile] = {}
         texts: dict[str, tuple[str, str]] = {}
         for f in files:
@@ -465,10 +471,13 @@ def scan_project(conn: sqlite3.Connection, project_id: int) -> tuple[list[Route]
             for call in _scan_calls(audit["id"], path, code, language, receivers):
                 if (call.source_path, call.line) not in traced_lines:
                     audit_calls.append(call)
+        for call in audit_calls:
+            if call.source_path in backend:
+                call.status = "external"
         calls.extend(audit_calls)
         frontend_texts.update(
             {(audit["id"], p): code for p, (code, lang) in texts.items()
-             if p not in routers and lang in JS_LANGUAGES + ("Dart",)}
+             if p not in routers and p not in backend and lang in JS_LANGUAGES + ("Dart",)}
         )
 
     match_calls(calls, routes)

@@ -52,6 +52,7 @@ BACKEND = {
         "  return res.data;\n"
         "}\n"
     ),
+    "web/package.json": json.dumps({"name": "web", "dependencies": {"react": "^18.2.0", "react-dom": "^18.2.0"}}),
     "web/axios.ts": (
         'import axios from "axios";\n'
         "let url = `${import.meta.env.VITE_SERVER_URL}/api`;\n"

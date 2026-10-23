@@ -13,6 +13,17 @@ class FileRecord:
     line_count: int | None
     module_path: str | None
     note: str | None = None
+    app_root: str | None = None
+
+
+@dataclass
+class AppRecord:
+    root: str
+    app_type: str
+    manifests: list[str]
+    file_count: int
+    evidence: list[dict]
+    also_targets: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -76,3 +87,4 @@ class Inventory:
     relationships: list[Relationship] = field(default_factory=list)
     unsupported: list[Unsupported] = field(default_factory=list)
     skipped: list[Skipped] = field(default_factory=list)
+    apps: list[AppRecord] = field(default_factory=list)

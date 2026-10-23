@@ -69,6 +69,36 @@ def open_repository(path: str | os.PathLike[str]) -> GitRepository:
     )
 
 
+SEARCH_DEPTH = 4
+_SKIP_DIRS = frozenset({"node_modules", "build", "dist", "Pods", "venv", "__pycache__"})
+
+
+def find_repositories(path: str | os.PathLike[str]) -> list[GitRepository]:
+    """The repository containing `path`, or else every repository in the folders below it.
+
+    Dependency, build, and hidden folders are not searched, and the search does not descend into a
+    repository it found or go more than SEARCH_DEPTH folders down."""
+    path = Path(path).expanduser().resolve()
+    if not path.is_dir():
+        raise RepositoryError(f"{path} is not a directory")
+    if _git(path, "rev-parse", "--show-toplevel").returncode == 0:
+        return [open_repository(path)]
+    found: list[GitRepository] = []
+    for current, dirs, _ in os.walk(path):
+        here = Path(current)
+        depth = len(here.relative_to(path).parts)
+        if (here / ".git").exists() and here != path:
+            found.append(open_repository(here))
+            dirs.clear()
+            continue
+        dirs[:] = sorted(
+            d for d in dirs if depth < SEARCH_DEPTH and not d.startswith(".") and d not in _SKIP_DIRS
+        )
+    if not found:
+        raise RepositoryError(f"{path} is not inside a Git working tree and contains no Git repositories")
+    return found
+
+
 def _ls_files(root: Path, *args: str) -> list[str]:
     output = _git_output(root, "ls-files", "-z", *args)
     return sorted({p for p in output.split("\0") if p})

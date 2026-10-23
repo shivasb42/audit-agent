@@ -8,10 +8,11 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
+from audit_agent.inventory.apps import APP_TYPES
 from audit_agent.inventory.models import Inventory
 from audit_agent.repo import GitRepository
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 SCHEMA = """
 CREATE TABLE audits (
@@ -239,7 +240,32 @@ CREATE INDEX findings_task ON findings (task_id);
 CREATE INDEX task_runs_task ON task_runs (task_id);
 """
 
-SCHEMA += TASK_TABLES + API_TABLES + API_TRACE_TABLES + FINDING_TABLES
+APP_TABLES = f"""
+ALTER TABLE inventory_files ADD COLUMN app_root TEXT;
+ALTER TABLE projects ADD COLUMN root_path TEXT;
+
+CREATE TABLE inventory_apps (
+    audit_id INTEGER NOT NULL REFERENCES audits(id) ON DELETE CASCADE,
+    root TEXT NOT NULL,
+    app_type TEXT NOT NULL CHECK (app_type IN {APP_TYPES}),
+    detected_type TEXT NOT NULL CHECK (detected_type IN {APP_TYPES}),
+    type_source TEXT NOT NULL CHECK (type_source IN ('detected', 'engineer')),
+    manifests TEXT NOT NULL,
+    evidence TEXT NOT NULL,
+    also_targets TEXT NOT NULL,
+    file_count INTEGER NOT NULL,
+    PRIMARY KEY (audit_id, root)
+);
+
+-- Keyed by the app folder's absolute path so a correction applies to every later audit of it.
+CREATE TABLE app_type_overrides (
+    app_path TEXT PRIMARY KEY,
+    app_type TEXT NOT NULL CHECK (app_type IN {APP_TYPES}),
+    updated_at TEXT NOT NULL
+);
+"""
+
+SCHEMA += TASK_TABLES + API_TABLES + API_TRACE_TABLES + FINDING_TABLES + APP_TABLES
 
 SECTIONS = {
     "files": ("inventory_files", "path"),
@@ -249,6 +275,7 @@ SECTIONS = {
     "relationships": ("inventory_relationships", "source_path, line"),
     "unsupported": ("inventory_unsupported", "kind, technology"),
     "skipped": ("inventory_skipped", "file_count DESC"),
+    "apps": ("inventory_apps", "root"),
 }
 
 # Each entry upgrades the schema from version N to N + 1.
@@ -278,6 +305,7 @@ MIGRATIONS = {
     4: API_TABLES,
     5: API_TRACE_TABLES,
     6: FINDING_TABLES,
+    7: APP_TABLES,
 }
 
 
@@ -344,15 +372,40 @@ def mark_failed(conn: sqlite3.Connection, audit_id: int, error: str) -> None:
         )
 
 
+def app_path(repo_path: str, root: str) -> str:
+    return repo_path if root == "." else str(Path(repo_path) / root)
+
+
+def app_name(repo_name: str, root: str) -> str:
+    return repo_name if root == "." else f"{repo_name}/{root}"
+
+
 def save_inventory(conn: sqlite3.Connection, audit_id: int, inventory: Inventory) -> None:
+    repo_path = get_audit(conn, audit_id)["repo_path"]
+    overrides = dict(conn.execute("SELECT app_path, app_type FROM app_type_overrides").fetchall())
     with conn:
         conn.executemany(
-            """INSERT INTO inventory_files VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO inventory_files (audit_id, path, category, language, supported, size_bytes,
+                                            line_count, module_path, note, app_root)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             [
                 (audit_id, f.path, f.category, f.language, int(f.supported), f.size_bytes,
-                 f.line_count, f.module_path, f.note)
+                 f.line_count, f.module_path, f.note, f.app_root)
                 for f in inventory.files
             ],
+        )
+        rows = []
+        for app in inventory.apps:
+            corrected = overrides.get(app_path(repo_path, app.root))
+            rows.append(
+                (audit_id, app.root, corrected or app.app_type, app.app_type, "engineer" if corrected else "detected",
+                 json.dumps(app.manifests), json.dumps(app.evidence), ",".join(app.also_targets), app.file_count)
+            )
+        conn.executemany(
+            """INSERT INTO inventory_apps (audit_id, root, app_type, detected_type, type_source, manifests,
+                                           evidence, also_targets, file_count)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            rows,
         )
         conn.executemany(
             "INSERT INTO inventory_modules VALUES (?, ?, ?, ?, ?, ?)",
@@ -482,10 +535,11 @@ def task_context(conn: sqlite3.Connection, task_id: int) -> dict[str, list[sqlit
                             WHERE e.audit_id = :audit AND e.path IN ({in_task}) ORDER BY e.path""",
         "api_calls": f"""SELECT c.source_path AS path, c.line, c.method, COALESCE(c.pattern, c.raw) AS url, c.status, c.via,
                                 r.method AS route_method, r.path AS route_path, r.handler_path,
-                                ra.repo_name AS route_repo
+                                ra.repo_name AS route_repo, rf.app_root AS route_app_root
                          FROM api_calls c
                          LEFT JOIN api_routes r ON r.id = c.route_id
                          LEFT JOIN audits ra ON ra.id = r.audit_id
+                         LEFT JOIN inventory_files rf ON rf.audit_id = r.audit_id AND rf.path = r.file_path
                          WHERE c.audit_id = :audit AND c.source_path IN ({in_task}) AND c.status != 'external'
                          ORDER BY CASE c.status WHEN 'broken' THEN 0 WHEN 'wrong_method' THEN 1
                                   WHEN 'unresolved' THEN 2 ELSE 3 END, c.source_path, c.line""",
@@ -514,6 +568,82 @@ def create_project(conn: sqlite3.Connection, name: str, audit_ids: list[int]) ->
             [(project_id, a) for a in audit_ids],
         )
     return project_id
+
+
+def create_folder_project(conn: sqlite3.Connection, root_path: str, audit_ids: list[int]) -> int:
+    """The project for a folder given to `start`, named after the folder. Starting the same folder
+    again reuses its project and replaces its audits, so an older audit is never mapped twice."""
+    with conn:
+        row = conn.execute("SELECT id FROM projects WHERE root_path = ?", (root_path,)).fetchone()
+        if row:
+            project_id = row[0]
+        else:
+            base = name = Path(root_path).name or root_path
+            suffix = 1
+            while conn.execute("SELECT 1 FROM projects WHERE name = ?", (name,)).fetchone():
+                suffix += 1
+                name = f"{base} ({suffix})"
+            project_id = conn.execute(
+                "INSERT INTO projects (name, created_at, root_path) VALUES (?, ?, ?)", (name, _now(), root_path)
+            ).lastrowid
+        conn.execute("DELETE FROM project_audits WHERE project_id = ?", (project_id,))
+        conn.executemany(
+            "INSERT INTO project_audits (project_id, audit_id) VALUES (?, ?)", [(project_id, a) for a in audit_ids]
+        )
+    return project_id
+
+
+def list_apps(conn: sqlite3.Connection, audit_ids: list[int]) -> list[sqlite3.Row]:
+    marks = ", ".join("?" * len(audit_ids))
+    return conn.execute(
+        f"""SELECT ap.*, a.repo_name, a.repo_path FROM inventory_apps ap JOIN audits a ON a.id = ap.audit_id
+            WHERE ap.audit_id IN ({marks}) ORDER BY a.repo_name, ap.root""",
+        audit_ids,
+    ).fetchall()
+
+
+def _all_apps(conn: sqlite3.Connection) -> list[tuple[str, sqlite3.Row]]:
+    rows = conn.execute(
+        "SELECT ap.audit_id, ap.root, a.repo_name, a.repo_path FROM inventory_apps ap JOIN audits a ON a.id = ap.audit_id"
+    ).fetchall()
+    return [(app_path(r["repo_path"], r["root"]), r) for r in rows]
+
+
+def find_app_path(conn: sqlite3.Connection, ref: str) -> str:
+    """The folder of an inventoried app, given its path or its name (`repo` or `repo/sub/folder`)."""
+    resolved = str(Path(ref).expanduser().resolve())
+    paths = {path for path, r in _all_apps(conn) if path == resolved or app_name(r["repo_name"], r["root"]) == ref}
+    if not paths:
+        raise StoreError(f"No inventoried app named or at {ref!r}. List apps with: audit-agent apps")
+    if len(paths) > 1:
+        raise StoreError(f"{ref!r} matches several apps; give one of these paths instead: " + ", ".join(sorted(paths)))
+    return paths.pop()
+
+
+def set_app_type(conn: sqlite3.Connection, path: str, app_type: str) -> list[int]:
+    """Record the engineer's type for the app at `path`, kept for later audits too, and apply it to
+    the audits that already have this app. Returns those audits' ids."""
+    if app_type not in APP_TYPES:
+        raise StoreError(f"App type must be one of {', '.join(APP_TYPES)}")
+    matches = [(r["audit_id"], r["root"]) for p, r in _all_apps(conn) if p == path]
+    with conn:
+        conn.execute(
+            """INSERT INTO app_type_overrides (app_path, app_type, updated_at) VALUES (?, ?, ?)
+               ON CONFLICT (app_path) DO UPDATE SET app_type = excluded.app_type, updated_at = excluded.updated_at""",
+            (path, app_type, _now()),
+        )
+        conn.executemany(
+            "UPDATE inventory_apps SET app_type = ?, type_source = 'engineer' WHERE audit_id = ? AND root = ?",
+            [(app_type, audit_id, root) for audit_id, root in matches],
+        )
+    return sorted({audit_id for audit_id, _ in matches})
+
+
+def projects_of(conn: sqlite3.Connection, audit_ids: list[int]) -> list[int]:
+    marks = ", ".join("?" * len(audit_ids))
+    return [r[0] for r in conn.execute(
+        f"SELECT DISTINCT project_id FROM project_audits WHERE audit_id IN ({marks}) ORDER BY project_id", audit_ids
+    )]
 
 
 def get_project(conn: sqlite3.Connection, ref: str | int) -> sqlite3.Row:

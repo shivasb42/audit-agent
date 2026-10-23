@@ -1,4 +1,4 @@
-"""Discover a repository's files, languages, dependencies, modules, entry points, and imports."""
+"""Discover a repository's files, languages, dependencies, modules, entry points, imports, and apps."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import tomllib
 from collections import defaultdict
 from pathlib import PurePosixPath
 
-from audit_agent.inventory import entry_points, imports, manifests
+from audit_agent.inventory import apps, entry_points, imports, manifests
 from audit_agent.inventory.languages import (
     SUPPORTED_LANGUAGES,
     classify,
@@ -251,4 +251,5 @@ def discover(repo: GitRepository, include_untracked: bool = False) -> Inventory:
                 reason="Source files this large are inventoried but not read or analyzed.",
             )
         )
+    inventory.apps = apps.detect(files, texts, inventory.dependencies, inventory.entry_points)
     return inventory

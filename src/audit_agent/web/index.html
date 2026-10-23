@@ -3,16 +3,21 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Audit tasks</title>
+<title>Audit review</title>
 <style>
   :root {
     --bg: #f6f7f9; --panel: #fff; --text: #1d2330; --muted: #677085; --line: #e3e6ec;
     --accent: #2f6fed; --danger: #c93a3a; --ok: #2a8a55;
+    --backend: #8a4b0f; --backend-bg: #fbefe3; --web: #1f5fbf; --web-bg: #e8f0fd; --mobile: #2a7a4b; --mobile-bg: #e6f4ec;
   }
   * { box-sizing: border-box; }
   body { margin: 0; font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); }
-  header { display: flex; align-items: center; gap: 16px; padding: 12px 20px; background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 2; }
+  header { display: flex; align-items: center; gap: 16px; padding: 12px 20px; background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 3; height: 57px; }
   header h1 { font-size: 16px; margin: 0; }
+  .tabs { display: flex; gap: 4px; margin-left: 8px; }
+  .tabs button { border-color: transparent; background: transparent; color: var(--muted); }
+  .tabs button.active { background: #eef4ff; color: var(--accent); border-color: #cfdcfb; }
+  .tabs button:disabled { opacity: .4; }
   select, input, button { font: inherit; }
   select, input { padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: #fff; }
   button { padding: 6px 12px; border: 1px solid var(--line); border-radius: 6px; background: #fff; cursor: pointer; }
@@ -20,87 +25,130 @@
   button.danger { color: #fff; background: var(--danger); border-color: var(--danger); }
   button.ok { color: #fff; background: var(--ok); border-color: var(--ok); }
   button:disabled { opacity: .45; cursor: default; }
-  main { display: grid; grid-template-columns: minmax(0, 1fr) 440px; gap: 16px; padding: 16px 20px; }
+  .layout { display: grid; grid-template-columns: 270px minmax(0, 1fr); gap: 16px; padding: 16px 20px; }
+  nav { padding: 10px 0; position: sticky; top: 73px; align-self: start; max-height: calc(100vh - 90px); overflow: auto; }
+  .project { padding: 6px 0 10px; border-bottom: 1px solid var(--line); }
+  .project:last-child { border-bottom: 0; }
+  .project-name { padding: 4px 14px; font-weight: 600; }
+  .project-path { padding: 0 14px 4px; color: var(--muted); font-size: 12px; word-break: break-all; }
+  .app { display: flex; align-items: center; gap: 8px; padding: 6px 14px; cursor: pointer; }
+  .app:hover { background: #f8faff; }
+  .app.active { background: #eef4ff; box-shadow: inset 3px 0 0 var(--accent); }
+  .app .name { flex: 1; min-width: 0; word-break: break-all; }
+  .app .count { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .api-link { display: block; margin: 4px 14px 0; padding: 4px 10px; font-size: 13px; }
+  .api-link.active { border-color: var(--accent); color: var(--accent); }
+  .type { display: inline-block; padding: 0 7px; border-radius: 999px; font-size: 11px; font-weight: 600; background: #eef1f6; color: var(--muted); white-space: nowrap; }
+  .type.backend { background: var(--backend-bg); color: var(--backend); }
+  .type.web { background: var(--web-bg); color: var(--web); }
+  .type.mobile { background: var(--mobile-bg); color: var(--mobile); }
+  .tasks-grid { display: grid; grid-template-columns: minmax(0, 1fr) 420px; gap: 16px; }
   .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+  .app-info { padding: 12px 14px; border-bottom: 1px solid var(--line); }
+  .app-info h2 { font-size: 15px; margin: 0 0 2px; display: flex; gap: 8px; align-items: center; }
+  .app-info ul { margin: 6px 0 0; padding-left: 18px; font-size: 13px; }
+  .app-info li.supporting { color: var(--muted); }
   .counts { display: flex; gap: 8px; flex-wrap: wrap; padding: 12px 14px; border-bottom: 1px solid var(--line); }
   .chip { padding: 2px 10px; border-radius: 999px; background: #eef1f6; color: var(--muted); font-size: 12px; cursor: pointer; border: 1px solid transparent; }
   .chip.active { border-color: var(--accent); color: var(--accent); background: #eef4ff; }
   .filters { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; padding: 12px 14px; border-bottom: 1px solid var(--line); }
   .filters input[type=text] { width: 190px; }
-  .bulk { display: flex; gap: 8px; align-items: center; padding: 10px 14px; border-bottom: 1px solid var(--line); color: var(--muted); }
+  .bulk { display: flex; gap: 8px; align-items: center; padding: 10px 14px; border-bottom: 1px solid var(--line); color: var(--muted); flex-wrap: wrap; }
   .bulk .spacer { flex: 1; }
   table { width: 100%; border-collapse: collapse; }
   th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
-  th { font-size: 12px; color: var(--muted); font-weight: 600; background: #fafbfc; position: sticky; top: 57px; }
+  th { font-size: 12px; color: var(--muted); font-weight: 600; background: #fafbfc; position: sticky; top: 57px; z-index: 1; }
   tr.row { cursor: pointer; }
   tr.row:hover td { background: #f8faff; }
   tr.row.selected td { background: #eef4ff; }
   tr.row.cancelled td { color: var(--muted); }
   tr.row.cancelled .title { text-decoration: line-through; }
-  td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
   .reason { color: var(--muted); font-size: 12px; }
   .badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; background: #eef1f6; }
   .badge.pending { background: #eef4ff; color: var(--accent); }
-  .badge.cancelled { background: #f9eaea; color: var(--danger); }
+  .badge.cancelled, .badge.broken, .badge.wrong_method { background: #f9eaea; color: var(--danger); }
   .badge.done { background: #e8f5ee; color: var(--ok); }
   .badge.test { background: #f3eefc; color: #6b46c1; margin-left: 6px; }
   aside { padding: 14px 16px; position: sticky; top: 73px; align-self: start; max-height: calc(100vh - 90px); overflow: auto; }
   aside h2 { font-size: 15px; margin: 0 0 4px; }
-  aside h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 16px 0 6px; }
+  aside h3, .api h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 16px 0 6px; }
   aside ul { margin: 0; padding-left: 18px; }
   aside li { margin: 2px 0; word-break: break-all; }
   .empty { color: var(--muted); padding: 24px; text-align: center; }
   .gaps { padding: 12px 14px; color: var(--muted); font-size: 13px; }
-  code { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
+  code { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
+  .api { padding: 4px 16px 16px; }
+  .api section { margin-top: 8px; }
+  .api h2 { font-size: 16px; margin: 12px 0 2px; }
+  .api h3 { display: flex; align-items: center; gap: 10px; }
+  .api h3 input { text-transform: none; letter-spacing: 0; font-weight: 400; width: 260px; }
+  .links { display: flex; gap: 10px; flex-wrap: wrap; }
+  .link-card { border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px; min-width: 240px; }
+  .link-card .n { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  details summary { cursor: pointer; color: var(--accent); font-size: 12px; }
   #toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: #1d2330; color: #fff; padding: 8px 14px; border-radius: 8px; opacity: 0; transition: opacity .2s; }
   #toast.show { opacity: 1; }
+  [hidden] { display: none !important; }
 </style>
 </head>
 <body>
 <header>
-  <h1>Audit tasks</h1>
-  <select id="audit"></select>
-  <span id="repo" class="reason"></span>
+  <h1>Audit review</h1>
+  <span id="where" class="reason"></span>
+  <div class="tabs">
+    <button id="tab-tasks" class="active">Tasks</button>
+    <button id="tab-api">API map</button>
+  </div>
 </header>
-<main>
-  <section class="panel">
-    <div class="counts" id="counts"></div>
-    <div class="filters">
-      <select id="status"><option value="">Any status</option></select>
-      <input id="folder" type="text" placeholder="Folder, e.g. scripts">
-      <select id="tests">
-        <option value="">Tests and app code</option>
-        <option value="hide">Hide test code</option>
-        <option value="only">Only test code</option>
-      </select>
-      <input id="search" type="text" placeholder="Search titles and files">
+<div class="layout">
+  <nav class="panel" id="sidebar"><div class="empty">Loading…</div></nav>
+  <div id="content">
+    <div id="tasks-view" class="tasks-grid">
+      <section class="panel">
+        <div class="app-info" id="app-info"></div>
+        <div class="counts" id="counts"></div>
+        <div class="filters">
+          <select id="status"><option value="">Any status</option></select>
+          <input id="folder" type="text" placeholder="Folder, e.g. scripts">
+          <select id="tests">
+            <option value="">Tests and app code</option>
+            <option value="hide">Hide test code</option>
+            <option value="only">Only test code</option>
+          </select>
+          <input id="search" type="text" placeholder="Search titles and files">
+        </div>
+        <div class="bulk">
+          <span id="selection">0 selected</span>
+          <button id="cancel-selected" disabled>Cancel selected</button>
+          <button id="restore-selected" disabled>Restore selected</button>
+          <span class="spacer"></span>
+          <span id="matching"></span>
+          <button id="cancel-matching" class="danger">Cancel all matching</button>
+          <button id="restore-matching" class="ok">Restore all matching</button>
+        </div>
+        <table>
+          <thead><tr>
+            <th><input type="checkbox" id="select-all" title="Select all shown"></th>
+            <th class="num">Priority</th><th>Task</th><th>Status</th><th class="num">Files</th><th class="num">Lines</th><th></th>
+          </tr></thead>
+          <tbody id="rows"></tbody>
+        </table>
+        <div class="gaps" id="gaps"></div>
+      </section>
+      <aside class="panel" id="detail"><div class="empty">Select a task to see its files and connections.</div></aside>
     </div>
-    <div class="bulk">
-      <span id="selection">0 selected</span>
-      <button id="cancel-selected" disabled>Cancel selected</button>
-      <button id="restore-selected" disabled>Restore selected</button>
-      <span class="spacer"></span>
-      <span id="matching"></span>
-      <button id="cancel-matching" class="danger">Cancel all matching</button>
-      <button id="restore-matching" class="ok">Restore all matching</button>
-    </div>
-    <table>
-      <thead><tr>
-        <th><input type="checkbox" id="select-all" title="Select all shown"></th>
-        <th class="num">Priority</th><th>Task</th><th>Status</th><th class="num">Files</th><th class="num">Lines</th><th></th>
-      </tr></thead>
-      <tbody id="rows"></tbody>
-    </table>
-    <div class="gaps" id="gaps"></div>
-  </section>
-  <aside class="panel" id="detail"><div class="empty">Select a task to see its files and connections.</div></aside>
-</main>
+    <div id="api-view" class="panel api" hidden></div>
+  </div>
+</div>
 <div id="toast"></div>
 <script>
 const STATUSES = ["pending", "running", "done", "failed", "blocked", "cancelled"];
+const TYPE_LABELS = { backend: "Backend", web: "Web", mobile: "Mobile", unknown: "Unknown" };
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
-const state = { audit: null, tasks: [], selected: new Set(), openTask: null };
+const typeBadge = (t) => `<span class="type ${esc(t)}">${TYPE_LABELS[t] || esc(t)}</span>`;
+const state = { groups: [], app: null, project: null, tab: "tasks", tasks: [], selected: new Set(), openTask: null, apiMap: null };
 
 async function api(path, body) {
   const options = body === undefined ? {} : {
@@ -122,37 +170,99 @@ function toast(text) {
   toast.timer = setTimeout(() => t.classList.remove("show"), 2200);
 }
 
+const appKey = (a) => `${a.audit_id}:${a.root ?? ""}`;
+const taskTotal = (a) => Object.values(a.task_counts).reduce((x, y) => x + y, 0);
+
 function filter() {
-  return { status: $("status").value, folder: $("folder").value.trim(), tests: $("tests").value, search: $("search").value.trim() };
+  return {
+    status: $("status").value, folder: $("folder").value.trim(), tests: $("tests").value, search: $("search").value.trim(),
+    app: state.app?.root ?? "",
+  };
 }
 
-async function loadAudits() {
-  const audits = await api("/api/audits");
-  $("audit").innerHTML = audits.map((a) => {
-    const total = Object.values(a.task_counts).reduce((x, y) => x + y, 0);
-    return `<option value="${a.id}">#${a.id} ${esc(a.repo_name)} (${total} tasks)</option>`;
-  }).join("");
-  state.audits = audits;
-  const fromHash = Number(location.hash.slice(1));
-  if (audits.some((a) => a.id === fromHash)) $("audit").value = fromHash;
-  await selectAudit();
+function writeHash() {
+  const p = new URLSearchParams();
+  if (state.tab === "api" && state.project?.id) { p.set("project", state.project.id); p.set("tab", "api"); }
+  else if (state.app) p.set("app", appKey(state.app));
+  history.replaceState(null, "", "#" + p);
 }
 
-async function selectAudit() {
-  state.audit = Number($("audit").value);
-  location.hash = state.audit;
-  const audit = state.audits.find((a) => a.id === state.audit);
-  $("repo").textContent = audit ? `${audit.repo_path} @ ${audit.commit}` : "";
-  state.selected.clear();
-  state.openTask = null;
-  $("detail").innerHTML = '<div class="empty">Select a task to see its files and connections.</div>';
+function renderSidebar() {
+  if (!state.groups.length) {
+    $("sidebar").innerHTML = '<div class="empty">No audits yet. Run <code>audit-agent start &lt;folder&gt;</code>.</div>';
+    return;
+  }
+  $("sidebar").innerHTML = state.groups.map((g, gi) => `
+    <div class="project">
+      <div class="project-name">${esc(g.name)}</div>
+      ${g.root_path ? `<div class="project-path">${esc(g.root_path)}</div>` : ""}
+      ${g.apps.map((a) => `
+        <div class="app ${state.tab === "tasks" && state.app && appKey(state.app) === appKey(a) ? "active" : ""}"
+             data-group="${gi}" data-key="${esc(appKey(a))}"
+             title="${esc(a.evidence.map((e) => e.signal).join("\n") || "no backend, web, or mobile signals")}">
+          ${typeBadge(a.type)}<span class="name">${esc(a.name)}</span><span class="count">${taskTotal(a)}</span>
+        </div>`).join("")}
+      ${g.id ? `<button class="api-link ${state.tab === "api" && state.project?.id === g.id ? "active" : ""}" data-project="${gi}">API map</button>` : ""}
+    </div>`).join("");
+}
+
+function renderAppInfo() {
+  const a = state.app;
+  if (!a) { $("app-info").innerHTML = ""; return; }
+  const also = a.also_targets.length ? `<span class="reason">also targets ${esc(a.also_targets.join(", "))}</span>` : "";
+  const source = a.type_source === "engineer" ? `<span class="reason">set by you; detected as ${esc(a.detected_type)}</span>` : "";
+  const evidence = a.not_detected
+    ? '<div class="reason">This audit was made before app types were detected. Run <code>audit-agent start</code> on its folder again to see its apps.</div>'
+    : a.evidence.length
+      ? `<ul>${a.evidence.map((e) => `<li class="${e.strength}">${typeBadge(e.type)} ${esc(e.signal)}${e.strength === "supporting" ? " (supporting)" : ""}</li>`).join("")}</ul>`
+      : `<div class="reason">No backend, web, or mobile signals${a.manifests.length ? ` (${esc(a.manifests.join(", "))})` : ""}.</div>`;
+  $("app-info").innerHTML = `
+    <h2>${esc(a.name)} ${typeBadge(a.type)} ${also} ${source}</h2>
+    <div class="reason"><code>${esc(a.path)}</code></div>
+    ${evidence}`;
+}
+
+async function loadGroups() {
+  state.groups = await api("/api/projects");
+  const hash = new URLSearchParams(location.hash.slice(1));
+  const apps = state.groups.flatMap((g) => g.apps.map((a) => ({ a, g })));
+  if (hash.get("tab") === "api") {
+    const g = state.groups.find((x) => String(x.id) === hash.get("project"));
+    if (g) return showApiMap(g);
+  }
+  const wanted = apps.find(({ a }) => appKey(a) === hash.get("app")) || apps[0];
+  if (wanted) return selectApp(wanted.a, wanted.g);
+  renderSidebar();
   await loadTasks();
 }
 
+async function selectApp(app, group) {
+  state.app = app;
+  state.project = group;
+  state.tab = "tasks";
+  state.selected.clear();
+  state.openTask = null;
+  $("detail").innerHTML = '<div class="empty">Select a task to see its files and connections.</div>';
+  showTab();
+  renderSidebar();
+  renderAppInfo();
+  writeHash();
+  await loadTasks();
+}
+
+function showTab() {
+  $("tasks-view").hidden = state.tab !== "tasks";
+  $("api-view").hidden = state.tab !== "api";
+  $("tab-tasks").classList.toggle("active", state.tab === "tasks");
+  $("tab-api").classList.toggle("active", state.tab === "api");
+  $("tab-api").disabled = !state.project?.id;
+  $("where").textContent = state.project ? state.project.name : "";
+}
+
 async function loadTasks() {
-  if (!state.audit) { $("rows").innerHTML = '<tr><td colspan="7" class="empty">No audits yet. Run audit-agent start and plan first.</td></tr>'; return; }
+  if (!state.app) { $("rows").innerHTML = '<tr><td colspan="7" class="empty">No audits yet. Run audit-agent start first.</td></tr>'; return; }
   const q = new URLSearchParams(Object.entries(filter()).filter(([, v]) => v));
-  const data = await api(`/api/audits/${state.audit}/tasks?${q}`);
+  const data = await api(`/api/audits/${state.app.audit_id}/tasks?${q}`);
   state.tasks = data.tasks;
   const shown = new Set(data.tasks.map((t) => t.id));
   for (const id of [...state.selected]) if (!shown.has(id)) state.selected.delete(id);
@@ -176,7 +286,7 @@ async function loadTasks() {
     </tr>`).join("") : '<tr><td colspan="7" class="empty">No tasks match these filters.</td></tr>';
 
   $("gaps").innerHTML = data.not_covered.length
-    ? "Not covered by any task: " + data.not_covered.map((g) => `${esc(g.what)} (${g.file_count} files)`).join(", ")
+    ? `Not covered by any task in ${esc(state.app.repo_name)}: ` + data.not_covered.map((g) => `${esc(g.what)} (${g.file_count} files)`).join(", ")
     : "Every analyzable file is covered by a task.";
   updateSelection();
 }
@@ -196,7 +306,7 @@ async function showTask(id) {
     : '<div class="reason">none</div>';
   $("detail").innerHTML = `
     <h2>${esc(d.task.title)}</h2>
-    <div class="reason">Task #${d.task.id} &middot; ${d.task.status} &middot; priority ${d.task.priority} (${esc(d.task.priority_reason)})</div>
+    <div class="reason">${d.app ? `${typeBadge(d.app.type)} ${esc(d.app.name)} &middot; ` : ""}Task #${d.task.id} &middot; ${d.task.status} &middot; priority ${d.task.priority} (${esc(d.task.priority_reason)})</div>
     <h3>Files to audit (${d.files.length})</h3>${list(d.files, (f) => `<code>${esc(f.path)}</code> <span class="reason">${f.line_count} lines</span>`, 100)}
     <h3>Entry points (${d.entry_points.length})</h3>${list(d.entry_points, (e) => `<code>${esc(e.path)}</code> <span class="reason">${esc(e.kind)}</span>`)}
     <h3>Imports of missing files (${d.unresolved.length})</h3>${list(d.unresolved, (u) => `<code>${esc(u.path)}:${u.line}</code> ${esc(u.specifier)}`)}
@@ -205,7 +315,7 @@ async function showTask(id) {
     <h3>Packages (${d.packages.length})</h3>${list(d.packages, (p) => `${esc(p.name)} <span class="reason">${p.uses}</span>`)}
     <h3>API calls made here (${d.api_calls.length})</h3>${list(d.api_calls, (c) => {
       const where = `<code>${esc(c.method)} ${esc(c.url)}</code> <span class="reason">${esc(c.path)}:${c.line}</span>`;
-      if (c.status === "matched") return `${where} &rarr; <code>${esc(c.route_repo)}: ${esc(c.handler_path)}</code>`;
+      if (c.status === "matched") return `${where} &rarr; <code>${esc(c.route_app)}: ${esc(c.handler_path)}</code>`;
       if (c.status === "wrong_method") return `${where} <strong style="color:var(--danger)">wrong method</strong> <span class="reason">route is ${esc(c.route_method)} ${esc(c.route_path)}</span>`;
       return `${where} <strong style="color:var(--danger)">${esc(c.status)}</strong>`;
     })}
@@ -222,20 +332,119 @@ async function changeMatching(action) {
   const count = state.tasks.length;
   if (!count) return;
   const verb = action === "cancel" ? "Cancel" : "Restore";
-  if (!confirm(`${verb} all ${count} tasks matching the current filters?`)) return;
-  const res = await api(`/api/audits/${state.audit}/${action}`, { filter: filter() });
+  if (!confirm(`${verb} all ${count} tasks matching the current filters in ${state.app.name}?`)) return;
+  const res = await api(`/api/audits/${state.app.audit_id}/${action}`, { filter: filter() });
   toast(`${verb}${action === "cancel" ? "led" : "d"} ${res.changed} task${res.changed === 1 ? "" : "s"}`);
   await refresh();
 }
 
 async function refresh() {
   await loadTasks();
-  const audits = await api("/api/audits");
-  state.audits = audits;
+  state.groups = await api("/api/projects");
+  renderSidebar();
   if (state.openTask) await showTask(state.openTask);
 }
 
-$("audit").addEventListener("change", selectAudit);
+// API map
+
+async function showApiMap(group) {
+  state.project = group;
+  state.tab = "api";
+  showTab();
+  renderSidebar();
+  writeHash();
+  $("api-view").innerHTML = '<div class="empty">Loading the API map…</div>';
+  state.apiMap = await api(`/api/projects/${group.id}/api-map`);
+  renderApiMap();
+}
+
+function table(headers, rows, empty) {
+  if (!rows.length) return `<div class="reason">${empty}</div>`;
+  return `<table><thead><tr>${headers.map((h) => `<th class="${h.endsWith("#") ? "num" : ""}">${esc(h.replace(/#$/, ""))}</th>`).join("")}</tr></thead>
+    <tbody>${rows.join("")}</tbody></table>`;
+}
+
+function callersCell(callers) {
+  if (!callers.length) return '<span class="reason">none</span>';
+  const line = (c) => `<div><span class="reason">${esc(c.app)}:</span> <code>${esc(c.path)}:${c.line}</code></div>`;
+  const first = callers.slice(0, 3).map(line).join("");
+  const rest = callers.slice(3);
+  return first + (rest.length ? `<details><summary>${rest.length} more</summary>${rest.map(line).join("")}</details>` : "");
+}
+
+function routeRows(search) {
+  const needle = search.toLowerCase();
+  return state.apiMap.routes
+    .filter((r) => !needle || [r.method, r.path, r.handler_path, r.file_path, ...r.callers.map((c) => c.path)]
+      .some((v) => String(v ?? "").toLowerCase().includes(needle)))
+    .map((r) => `<tr>
+      <td><code>${esc(r.method)}</code></td>
+      <td><code>${esc(r.path)}</code></td>
+      <td><span class="reason">${esc(r.app.name)}:</span> <code>${esc(r.handler_path || r.file_path)}</code></td>
+      <td class="num">${r.callers.length}</td>
+      <td>${callersCell(r.callers)}</td>
+    </tr>`);
+}
+
+function renderApiMap() {
+  const m = state.apiMap;
+  const labels = { matched: "matched", wrong_method: "wrong method", broken: "no route", unresolved: "built at runtime", external: "other services" };
+  const chips = Object.entries(m.counts).map(([s, n]) => `<span class="chip">${labels[s] || s} ${n}</span>`).join("");
+  const links = m.links.length
+    ? `<div class="links">${m.links.map((l) => `<div class="link-card">
+        <div>${typeBadge(l.from_type)} ${TYPE_LABELS[l.from_type]} to ${typeBadge(l.to_type)} ${TYPE_LABELS[l.to_type]}</div>
+        <div class="n">${l.calls}</div>
+        <div class="reason">${esc(l.from)} &rarr; ${esc(l.to)}</div></div>`).join("")}</div>`
+    : '<div class="reason">No calls matched a route yet.</div>';
+  const problems = table(["App", "Where", "Call", "Problem", "Closest route"], m.problems.map((p) => `<tr>
+      <td>${typeBadge(p.app_type)} ${esc(p.app)}</td>
+      <td><code>${esc(p.path)}:${p.line}</code></td>
+      <td><code>${esc(p.method)} ${esc(p.url)}</code></td>
+      <td><span class="badge ${p.status}">${p.status === "broken" ? "no route with this path" : "wrong method"}</span></td>
+      <td>${p.closest ? `<code>${esc(p.closest.method)} ${esc(p.closest.path)}</code>` : '<span class="reason">none close</span>'}</td>
+    </tr>`), "Every matched call reaches a route.");
+  const mentioned = table(["Route", "Mentioned in", "Text"], m.mentioned.map((x) => `<tr>
+      <td><code>${esc(x.method)} ${esc(x.path)}</code></td>
+      <td><span class="reason">${esc(x.app)}:</span> <code>${esc(x.file)}:${x.line}</code></td>
+      <td><code>${esc(x.text)}</code></td></tr>`), "None.");
+  const unused = table(["Method", "Path", "Handler"], m.unused.map((r) => `<tr>
+      <td><code>${esc(r.method)}</code></td><td><code>${esc(r.path)}</code></td>
+      <td><span class="reason">${esc(r.app.name)}:</span> <code>${esc(r.handler_path || r.file_path)}</code></td></tr>`), "None.");
+  $("api-view").innerHTML = `
+    <h2>${esc(m.project.name)}: API map</h2>
+    <div class="reason">Built ${esc(m.project.api_mapped_at || "not yet; run audit-agent map-api")}</div>
+    <div class="counts" style="padding-left:0">${chips}</div>
+    <section><h3>App links</h3>${links}</section>
+    <section><h3>Calls that don't reach a route (${m.problems.length})</h3>${problems}</section>
+    <section><h3>Backend routes (${m.routes.length}) <input id="route-search" type="text" placeholder="Search paths, handlers, callers"></h3>
+      <div id="route-table">${table(["Method", "Path", "Handler", "Callers#", "Called from"], routeRows(""), "No routes found.")}</div></section>
+    <section><h3>Only mentioned in frontend code (${new Set(m.mentioned.map((x) => x.method + x.path)).size} routes)</h3>${mentioned}</section>
+    <section><h3>Not referenced anywhere (${m.unused.length})</h3>${unused}</section>`;
+  let typingRoutes;
+  $("route-search").addEventListener("input", (e) => {
+    clearTimeout(typingRoutes);
+    typingRoutes = setTimeout(() => {
+      $("route-table").innerHTML = table(["Method", "Path", "Handler", "Callers#", "Called from"], routeRows(e.target.value.trim()), "No routes match.");
+    }, 150);
+  });
+}
+
+// Events
+
+$("sidebar").addEventListener("click", (e) => {
+  const app = e.target.closest(".app");
+  if (app) {
+    const group = state.groups[Number(app.dataset.group)];
+    return selectApp(group.apps.find((a) => appKey(a) === app.dataset.key), group);
+  }
+  const link = e.target.closest(".api-link");
+  if (link) showApiMap(state.groups[Number(link.dataset.project)]);
+});
+$("tab-tasks").addEventListener("click", () => {
+  const app = state.app && state.project?.apps.some((a) => appKey(a) === appKey(state.app)) ? state.app : state.project?.apps[0];
+  if (app) selectApp(app, state.project);
+});
+$("tab-api").addEventListener("click", () => { if (state.project?.id) showApiMap(state.project); });
 let typing;
 for (const id of ["folder", "search"]) $(id).addEventListener("input", () => { clearTimeout(typing); typing = setTimeout(loadTasks, 200); });
 for (const id of ["status", "tests"]) $(id).addEventListener("change", loadTasks);
@@ -267,7 +476,7 @@ $("restore-selected").addEventListener("click", () => change("restore", [...stat
 $("cancel-matching").addEventListener("click", () => changeMatching("cancel"));
 $("restore-matching").addEventListener("click", () => changeMatching("restore"));
 
-loadAudits().catch((err) => { $("rows").innerHTML = `<tr><td colspan="7" class="empty">${esc(err.message)}</td></tr>`; });
+loadGroups().catch((err) => { $("rows").innerHTML = `<tr><td colspan="7" class="empty">${esc(err.message)}</td></tr>`; });
 </script>
 </body>
 </html>

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import PurePosixPath
 
 SUPPORTED_LANGUAGES = frozenset({"JavaScript", "TypeScript", "Python", "Dart"})
@@ -123,6 +124,15 @@ GENERATED_SUFFIXES = (
 )
 GENERATED_DIRS_EXTRA = frozenset({".dart_tool", ".pub-cache", "Pods", ".gradle"})
 MINIFIED_AVERAGE_LINE_LENGTH = 500
+
+
+_TEST_DIRS = frozenset({"test", "tests", "__tests__", "integration_test", "test_driver", "e2e"})
+_TEST_NAME = re.compile(r"(\.|_)(test|spec)\.[^.]+$|^test_[^/]+\.py$")
+
+
+def is_test_path(path: str) -> bool:
+    parts = path.split("/")
+    return any(p in _TEST_DIRS for p in parts[:-1]) or bool(_TEST_NAME.search(parts[-1]))
 
 
 def is_junk_file(path: str) -> bool:

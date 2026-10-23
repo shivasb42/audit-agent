@@ -35,7 +35,7 @@ class CliTest(unittest.TestCase):
         self.assertEqual(before, repo_fingerprint(root))
 
         audits = run_cli("audits", "--db", self.db)
-        self.assertIn("inventoried", audits.stdout)
+        self.assertIn("planned", audits.stdout)
 
         summary = run_cli("inventory", "1", "--db", self.db)
         self.assertEqual(summary.returncode, 0, summary.stderr)
@@ -45,15 +45,15 @@ class CliTest(unittest.TestCase):
         self.assertIn({"source_path": "src/index.js", "target_path": "src/lib/util.js"},
                       [{k: r[k] for k in ("source_path", "target_path")} for r in rows])
 
-    def test_plan_then_list_and_show_tasks(self):
+    def test_start_plans_tasks_then_list_and_show_them(self):
         root = make_repo(self.base / "repo", NODE_REPO)
-        run_cli("start", str(root), "--db", self.db)
+        started = run_cli("start", str(root), "--db", self.db)
+        self.assertIn("created. List them with: audit-agent tasks 1", started.stdout)
 
         planned = run_cli("plan", "1", "--db", self.db)
         self.assertEqual(planned.returncode, 0, planned.stderr)
-        self.assertIn("Created", planned.stdout)
+        self.assertIn("already has", planned.stdout)
         self.assertIn("Not covered by any task:", planned.stdout)
-        self.assertIn("already has", run_cli("plan", "1", "--db", self.db).stdout)
 
         tasks = json.loads(run_cli("tasks", "1", "--json", "--db", self.db).stdout)
         self.assertTrue(tasks)
