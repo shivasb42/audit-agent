@@ -12,7 +12,7 @@ from audit_agent.inventory.apps import APP_TYPES
 from audit_agent.inventory.models import Inventory
 from audit_agent.repo import GitRepository
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 12
 
 SCHEMA = """
 CREATE TABLE audits (
@@ -265,7 +265,100 @@ CREATE TABLE app_type_overrides (
 );
 """
 
-SCHEMA += TASK_TABLES + API_TABLES + API_TRACE_TABLES + FINDING_TABLES + APP_TABLES
+TASK_KINDS = ("files", "api")
+
+API_TASK_TABLES = """
+ALTER TABLE audit_tasks ADD COLUMN kind TEXT NOT NULL DEFAULT 'files';
+ALTER TABLE audit_tasks ADD COLUMN app_root TEXT;
+ALTER TABLE audit_tasks ADD COLUMN task_key TEXT;
+ALTER TABLE audit_tasks ADD COLUMN detail TEXT;
+ALTER TABLE findings ADD COLUMN file_audit_id INTEGER REFERENCES audits(id) ON DELETE CASCADE;
+
+-- Files of an API-call task. Unlike audit_task_files, the same file can be in many of these
+-- tasks, and the files can come from any repository in the project.
+CREATE TABLE api_task_files (
+    task_id INTEGER NOT NULL REFERENCES audit_tasks(id) ON DELETE CASCADE,
+    audit_id INTEGER NOT NULL REFERENCES audits(id) ON DELETE CASCADE,
+    path TEXT NOT NULL,
+    role TEXT NOT NULL,
+    PRIMARY KEY (task_id, audit_id, path)
+);
+
+CREATE UNIQUE INDEX audit_tasks_key ON audit_tasks (audit_id, task_key) WHERE task_key IS NOT NULL;
+"""
+
+BATCH_STATUSES = ("submitting", "in_progress", "canceling", "ended", "imported", "failed")
+BATCH_ITEM_STATUSES = ("waiting", "done", "failed", "canceled")
+
+BATCH_TABLES = f"""
+-- A Claude Message Batch. The row is written before the batch is sent, so a crash while sending
+-- still leaves a record that recovery can match to the batch Anthropic created.
+CREATE TABLE claude_batches (
+    id INTEGER PRIMARY KEY,
+    anthropic_id TEXT UNIQUE,
+    status TEXT NOT NULL CHECK (status IN {BATCH_STATUSES}),
+    model TEXT NOT NULL,
+    request_count INTEGER NOT NULL,
+    succeeded INTEGER NOT NULL DEFAULT 0,
+    errored INTEGER NOT NULL DEFAULT 0,
+    canceled INTEGER NOT NULL DEFAULT 0,
+    expired INTEGER NOT NULL DEFAULT 0,
+    recovered INTEGER NOT NULL DEFAULT 0,
+    error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    ended_at TEXT
+);
+
+-- custom_id is the label sent with each request ("task-<id>-<random>"); results come back with it,
+-- so a result can always be matched to its task, even from a batch whose id was lost.
+CREATE TABLE claude_batch_items (
+    batch_id INTEGER NOT NULL REFERENCES claude_batches(id) ON DELETE CASCADE,
+    task_id INTEGER NOT NULL REFERENCES audit_tasks(id) ON DELETE CASCADE,
+    custom_id TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL CHECK (status IN {BATCH_ITEM_STATUSES}),
+    run_id INTEGER REFERENCES task_runs(id) ON DELETE SET NULL,
+    error TEXT,
+    PRIMARY KEY (batch_id, task_id)
+);
+
+CREATE INDEX claude_batch_items_task ON claude_batch_items (task_id, status);
+"""
+
+ISSUE_TABLES = """
+ALTER TABLE findings ADD COLUMN issue_url TEXT;
+"""
+
+# 'continued': Claude asked for more files, and the task went on to the next batch round.
+ROUND_ITEM_STATUSES = ("waiting", "done", "failed", "canceled", "continued")
+
+# SQLite can't change a CHECK constraint in place, so the items table is rebuilt to allow
+# 'continued' and to hold what a follow-up round needs.
+BATCH_ROUND_TABLES = f"""
+CREATE TABLE claude_batch_items_new (
+    batch_id INTEGER NOT NULL REFERENCES claude_batches(id) ON DELETE CASCADE,
+    task_id INTEGER NOT NULL REFERENCES audit_tasks(id) ON DELETE CASCADE,
+    custom_id TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL CHECK (status IN {ROUND_ITEM_STATUSES}),
+    run_id INTEGER REFERENCES task_runs(id) ON DELETE SET NULL,
+    error TEXT,
+    round INTEGER NOT NULL DEFAULT 1,
+    extra_files TEXT NOT NULL DEFAULT '[]',
+    previous_report TEXT,
+    prior_cost_usd REAL NOT NULL DEFAULT 0,
+    report TEXT,
+    cost_usd REAL,
+    PRIMARY KEY (batch_id, task_id)
+);
+INSERT INTO claude_batch_items_new (batch_id, task_id, custom_id, status, run_id, error)
+    SELECT batch_id, task_id, custom_id, status, run_id, error FROM claude_batch_items;
+DROP TABLE claude_batch_items;
+ALTER TABLE claude_batch_items_new RENAME TO claude_batch_items;
+CREATE INDEX claude_batch_items_task ON claude_batch_items (task_id, status);
+"""
+
+SCHEMA += (TASK_TABLES + API_TABLES + API_TRACE_TABLES + FINDING_TABLES + APP_TABLES + API_TASK_TABLES + BATCH_TABLES
+           + ISSUE_TABLES + BATCH_ROUND_TABLES)
 
 SECTIONS = {
     "files": ("inventory_files", "path"),
@@ -306,6 +399,10 @@ MIGRATIONS = {
     5: API_TRACE_TABLES,
     6: FINDING_TABLES,
     7: APP_TABLES,
+    8: API_TASK_TABLES,
+    9: BATCH_TABLES,
+    10: ISSUE_TABLES,
+    11: BATCH_ROUND_TABLES,
 }
 
 
@@ -487,11 +584,14 @@ def save_tasks(conn: sqlite3.Connection, audit_id: int, tasks: list) -> None:
 
 
 def task_count(conn: sqlite3.Connection, audit_id: int) -> int:
-    return conn.execute("SELECT COUNT(*) FROM audit_tasks WHERE audit_id = ?", (audit_id,)).fetchone()[0]
+    """How many file tasks planning created for the audit (API-call tasks are counted apart)."""
+    return conn.execute(
+        "SELECT COUNT(*) FROM audit_tasks WHERE audit_id = ? AND kind = 'files'", (audit_id,)
+    ).fetchone()[0]
 
 
 def list_tasks(conn: sqlite3.Connection, audit_id: int, status: str | None = None) -> list[sqlite3.Row]:
-    sql = """SELECT t.*, COUNT(f.path) AS file_count
+    sql = """SELECT t.*, COUNT(f.path) + (SELECT COUNT(*) FROM api_task_files af WHERE af.task_id = t.id) AS file_count
              FROM audit_tasks t LEFT JOIN audit_task_files f ON f.task_id = t.id
              WHERE t.audit_id = ?"""
     params: list = [audit_id]
@@ -509,9 +609,73 @@ def get_task(conn: sqlite3.Connection, task_id: int) -> sqlite3.Row:
     return row
 
 
+def save_api_tasks(conn: sqlite3.Connection, audit_ids: list[int], tasks: list) -> dict[str, int]:
+    """Create or refresh API-call tasks by key. A task that hasn't run yet is updated to the latest
+    map; one that ran keeps its files and status. Pending API tasks of these audits whose call no
+    longer exists are deleted, since nothing was learned from them."""
+    now = _now()
+    counts = {"created": 0, "updated": 0, "removed": 0}
+    wanted = {(t.audit_id, t.key) for t in tasks}
+    with conn:
+        for task in tasks:
+            row = conn.execute(
+                "SELECT id, status FROM audit_tasks WHERE audit_id = ? AND task_key = ?", (task.audit_id, task.key)
+            ).fetchone()
+            values = (task.title, task.line_count, task.priority, task.priority_reason, task.app_root,
+                      json.dumps(task.detail))
+            if row is None:
+                task_id = conn.execute(
+                    """INSERT INTO audit_tasks (audit_id, title, line_count, priority, priority_reason, app_root,
+                                                detail, kind, task_key, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, 'api', ?, ?, ?)""",
+                    (task.audit_id, *values, task.key, now, now),
+                ).lastrowid
+                counts["created"] += 1
+            elif row["status"] == "pending":
+                task_id = row["id"]
+                conn.execute(
+                    """UPDATE audit_tasks SET title = ?, line_count = ?, priority = ?, priority_reason = ?,
+                              app_root = ?, detail = ?, updated_at = ? WHERE id = ?""",
+                    (*values, now, task_id),
+                )
+                conn.execute("DELETE FROM api_task_files WHERE task_id = ?", (task_id,))
+                counts["updated"] += 1
+            else:
+                continue
+            conn.executemany(
+                "INSERT OR IGNORE INTO api_task_files (task_id, audit_id, path, role) VALUES (?, ?, ?, ?)",
+                [(task_id, audit_id, path, role) for audit_id, path, role in task.files],
+            )
+        marks = ", ".join("?" * len(audit_ids))
+        for row in conn.execute(
+            f"SELECT id, audit_id, task_key FROM audit_tasks WHERE kind = 'api' AND status = 'pending' AND audit_id IN ({marks})",
+            audit_ids,
+        ).fetchall():
+            if (row["audit_id"], row["task_key"]) not in wanted:
+                conn.execute("DELETE FROM audit_tasks WHERE id = ?", (row["id"],))
+                counts["removed"] += 1
+    return counts
+
+
+def api_task_files(conn: sqlite3.Connection, task_id: int) -> list[sqlite3.Row]:
+    return conn.execute(
+        """SELECT af.audit_id, af.path, af.role, a.repo_name, a.repo_path, f.language, f.line_count
+           FROM api_task_files af JOIN audits a ON a.id = af.audit_id
+           LEFT JOIN inventory_files f ON f.audit_id = af.audit_id AND f.path = af.path
+           WHERE af.task_id = ?
+           ORDER BY CASE af.role WHEN 'caller' THEN 0 WHEN 'wrapper' THEN 1 WHEN 'route' THEN 2 WHEN 'handler' THEN 3
+                    ELSE 4 END, a.repo_name, af.path""",
+        (task_id,),
+    ).fetchall()
+
+
 def task_context(conn: sqlite3.Connection, task_id: int) -> dict[str, list[sqlite3.Row]]:
-    """A task's files and what they connect to, read from the audit's inventory."""
+    """A task's files and what they connect to, read from the audit's inventory. An API-call task's
+    files come from every repository the call touches, each with its role."""
     task = get_task(conn, task_id)
+    if task["kind"] == "api":
+        empty = ("imports", "imported_by", "packages", "unresolved", "entry_points", "api_calls", "api_routes")
+        return {"files": api_task_files(conn, task_id), **{name: [] for name in empty}}
     params = {"audit": task["audit_id"], "task": task_id}
     in_task = "SELECT path FROM audit_task_files WHERE task_id = :task"
     queries = {
@@ -680,14 +844,161 @@ def related_audits(conn: sqlite3.Connection, audit_id: int) -> list[sqlite3.Row]
 
 
 def start_run(conn: sqlite3.Connection, task_id: int, agent: str) -> int:
+    """Claim the task and record a new run. The claim is one conditional update, so two workers
+    can never run the same task at once."""
     now = _now()
     with conn:
+        claimed = conn.execute(
+            """UPDATE audit_tasks SET status = 'running', updated_at = ?
+               WHERE id = ? AND status NOT IN ('running', 'cancelled')""",
+            (now, task_id),
+        ).rowcount
+        if not claimed:
+            raise StoreError(f"Task {task_id} is already running or was cancelled.")
         cursor = conn.execute(
             "INSERT INTO task_runs (task_id, agent, status, started_at) VALUES (?, ?, 'running', ?)",
             (task_id, agent, now),
         )
-        conn.execute("UPDATE audit_tasks SET status = 'running', updated_at = ? WHERE id = ?", (now, task_id))
     return cursor.lastrowid
+
+
+OPEN_BATCH_STATUSES = ("submitting", "in_progress", "canceling", "ended")
+
+
+def task_in_open_batch(conn: sqlite3.Connection, task_id: int) -> bool:
+    marks = ", ".join("?" * len(OPEN_BATCH_STATUSES))
+    return conn.execute(
+        f"""SELECT 1 FROM claude_batch_items i JOIN claude_batches b ON b.id = i.batch_id
+            WHERE i.task_id = ? AND i.status = 'waiting' AND b.status IN ({marks})""",
+        (task_id, *OPEN_BATCH_STATUSES),
+    ).fetchone() is not None
+
+
+def batched_task_ids(conn: sqlite3.Connection) -> set[int]:
+    """Tasks waiting for a result from an open batch."""
+    marks = ", ".join("?" * len(OPEN_BATCH_STATUSES))
+    return {r[0] for r in conn.execute(
+        f"""SELECT i.task_id FROM claude_batch_items i JOIN claude_batches b ON b.id = i.batch_id
+            WHERE i.status = 'waiting' AND b.status IN ({marks})""",
+        OPEN_BATCH_STATUSES,
+    )}
+
+
+def create_batch(conn: sqlite3.Connection, model: str, items: list[tuple]) -> int:
+    """Record a batch before it is sent. Each item is (task_id, custom_id) or (task_id, custom_id, round
+    details) for a follow-up round: {"round", "extra_files", "previous_report", "prior_cost_usd"}."""
+    now = _now()
+    with conn:
+        batch_id = conn.execute(
+            """INSERT INTO claude_batches (status, model, request_count, created_at, updated_at)
+               VALUES ('submitting', ?, ?, ?, ?)""",
+            (model, len(items), now, now),
+        ).lastrowid
+        rows = []
+        for task_id, custom_id, *rest in items:
+            details = rest[0] if rest else {}
+            rows.append((batch_id, task_id, custom_id, details.get("round", 1),
+                         json.dumps(details.get("extra_files") or []),
+                         json.dumps(details["previous_report"]) if details.get("previous_report") else None,
+                         details.get("prior_cost_usd") or 0))
+        conn.executemany(
+            """INSERT INTO claude_batch_items (batch_id, task_id, custom_id, status, round, extra_files,
+                                               previous_report, prior_cost_usd)
+               VALUES (?, ?, ?, 'waiting', ?, ?, ?, ?)""",
+            rows,
+        )
+    return batch_id
+
+
+def continue_batch_item(conn: sqlite3.Connection, custom_id: str, report: dict, cost_usd: float | None,
+                        next_batch_id: int | None) -> None:
+    """Close an item whose answer asked for more files; the task goes on in another round."""
+    with conn:
+        conn.execute(
+            "UPDATE claude_batch_items SET status = 'continued', report = ?, cost_usd = ?, error = ? WHERE custom_id = ?",
+            (json.dumps(report), cost_usd, f"continued in batch #{next_batch_id}" if next_batch_id else None, custom_id),
+        )
+
+
+def update_batch(conn: sqlite3.Connection, batch_id: int, **fields) -> None:
+    allowed = {"anthropic_id", "status", "succeeded", "errored", "canceled", "expired", "error", "ended_at"}
+    if unknown := set(fields) - allowed:
+        raise ValueError(f"unknown batch fields {unknown}")
+    assignments = ", ".join(f"{name} = ?" for name in fields)
+    with conn:
+        conn.execute(
+            f"UPDATE claude_batches SET {assignments}, updated_at = ? WHERE id = ?",
+            (*fields.values(), _now(), batch_id),
+        )
+
+
+def adopt_batch(conn: sqlite3.Connection, anthropic_id: str, status: str, model: str, request_count: int,
+                created_at: str) -> int:
+    """Record a batch found on Anthropic's side that this database had lost track of."""
+    with conn:
+        return conn.execute(
+            """INSERT INTO claude_batches (anthropic_id, status, model, request_count, recovered, created_at, updated_at)
+               VALUES (?, ?, ?, ?, 1, ?, ?)""",
+            (anthropic_id, status, model, request_count, created_at, _now()),
+        ).lastrowid
+
+
+def get_batch(conn: sqlite3.Connection, batch_id: int) -> sqlite3.Row:
+    row = conn.execute("SELECT * FROM claude_batches WHERE id = ?", (batch_id,)).fetchone()
+    if row is None:
+        raise StoreError(f"No batch with id {batch_id}")
+    return row
+
+
+def list_batches(conn: sqlite3.Connection, statuses: tuple[str, ...] | None = None) -> list[sqlite3.Row]:
+    sql = """SELECT b.*, (SELECT COUNT(*) FROM claude_batch_items i WHERE i.batch_id = b.id AND i.status = 'waiting')
+                    AS waiting,
+                    (SELECT COUNT(*) FROM claude_batch_items i WHERE i.batch_id = b.id AND i.status = 'continued')
+                    AS continued,
+                    (SELECT MAX(i.round) FROM claude_batch_items i WHERE i.batch_id = b.id) AS round
+             FROM claude_batches b"""
+    params: tuple = ()
+    if statuses:
+        sql += f" WHERE b.status IN ({', '.join('?' * len(statuses))})"
+        params = statuses
+    return conn.execute(sql + " ORDER BY b.id DESC", params).fetchall()
+
+
+def batch_item_by_custom_id(conn: sqlite3.Connection, custom_id: str) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM claude_batch_items WHERE custom_id = ?", (custom_id,)).fetchone()
+
+
+def add_batch_item(conn: sqlite3.Connection, batch_id: int, task_id: int, custom_id: str) -> None:
+    with conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO claude_batch_items (batch_id, task_id, custom_id, status) VALUES (?, ?, ?, 'waiting')",
+            (batch_id, task_id, custom_id),
+        )
+
+
+def finish_batch_item(conn: sqlite3.Connection, custom_id: str, status: str, run_id: int | None = None,
+                      error: str | None = None) -> None:
+    with conn:
+        conn.execute(
+            "UPDATE claude_batch_items SET status = ?, run_id = ?, error = ? WHERE custom_id = ?",
+            (status, run_id, error, custom_id),
+        )
+
+
+def fail_interrupted_runs(conn: sqlite3.Connection) -> int:
+    """Mark runs left 'running' by a process that stopped as failed, so their tasks can be sent
+    again. Returns how many tasks were affected."""
+    now = _now()
+    with conn:
+        conn.execute(
+            """UPDATE task_runs SET status = 'failed', finished_at = ?,
+                   error = 'Interrupted: the process running this investigation stopped before it finished.'
+               WHERE status = 'running'""",
+            (now,),
+        )
+        return conn.execute(
+            "UPDATE audit_tasks SET status = 'failed', updated_at = ? WHERE status = 'running'", (now,)
+        ).rowcount
 
 
 def finish_run(
@@ -727,26 +1038,30 @@ def save_findings(
     now = _now()
     rows = [
         (task_id, run_id, audit_id, agent, "finding", f["bug_type"], f["severity"], f["title"], f["file_path"],
-         f["line"], f["evidence"], f["explanation"], None, None, now)
+         f["line"], f["evidence"], f["explanation"], None, None, f.get("file_audit_id"), now)
         for f in findings
     ] + [
         (task_id, run_id, audit_id, agent, "needs_review", n.get("bug_type"), None, n["title"], n.get("file_path"),
          n.get("line"), n.get("evidence"), n["explanation"], n.get("why_unconfirmed"),
-         json.dumps(n.get("files_examined") or []), now)
+         json.dumps(n.get("files_examined") or []), n.get("file_audit_id"), now)
         for n in needs_review
     ]
     with conn:
         conn.executemany(
             """INSERT INTO findings (task_id, run_id, audit_id, agent, kind, bug_type, severity, title, file_path,
-                                     line, evidence, explanation, why_unconfirmed, files_examined, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                     line, evidence, explanation, why_unconfirmed, files_examined, file_audit_id,
+                                     created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             rows,
         )
 
 
 def list_findings(conn: sqlite3.Connection, *, audit_id: int | None = None, task_id: int | None = None,
                   kind: str | None = None) -> list[sqlite3.Row]:
-    sql = """SELECT f.*, t.title AS task_title FROM findings f JOIN audit_tasks t ON t.id = f.task_id WHERE 1 = 1"""
+    sql = """SELECT f.*, t.title AS task_title, fa.repo_name AS file_repo
+             FROM findings f JOIN audit_tasks t ON t.id = f.task_id
+             LEFT JOIN audits fa ON fa.id = COALESCE(f.file_audit_id, f.audit_id)
+             WHERE 1 = 1"""
     params: list = []
     if audit_id is not None:
         sql += " AND f.audit_id = ?"
@@ -760,6 +1075,11 @@ def list_findings(conn: sqlite3.Connection, *, audit_id: int | None = None, task
     sql += """ ORDER BY f.kind, CASE f.severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2
                WHEN 'low' THEN 3 ELSE 4 END, f.file_path, f.line"""
     return conn.execute(sql, params).fetchall()
+
+
+def set_finding_issue(conn: sqlite3.Connection, finding_id: int, url: str) -> None:
+    with conn:
+        conn.execute("UPDATE findings SET issue_url = ? WHERE id = ?", (url, finding_id))
 
 
 def task_runs(conn: sqlite3.Connection, task_id: int) -> list[sqlite3.Row]:

@@ -1,8 +1,10 @@
 import json
 import os
+import ssl
 import stat
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -164,6 +166,18 @@ class RunApiTest(unittest.TestCase):
         with self.assertRaises(investigate.InvestigationError) as caught:
             api_runner._send({}, "sk-ant-test-key", timeout=1)
         self.assertIn("turned off", str(caught.exception))
+
+    def test_certificate_errors_fail_at_once_with_the_fix(self):
+        error = urllib.error.URLError(ssl.SSLCertVerificationError("unable to get local issuer certificate"))
+        with mock.patch.dict(os.environ, {}, clear=False), \
+                mock.patch.object(api_runner.urllib.request, "urlopen", side_effect=error) as opened, \
+                mock.patch.object(api_runner.time, "sleep") as slept:
+            os.environ.pop("AUDIT_AGENT_OFFLINE")
+            with self.assertRaises(investigate.InvestigationError) as caught:
+                api_runner._send({}, "sk-ant-test-key", timeout=1)
+        self.assertIn("Install Certificates.command", str(caught.exception))
+        self.assertEqual(opened.call_count, 1)
+        slept.assert_not_called()
 
 
 class CredentialsTest(unittest.TestCase):

@@ -9,7 +9,7 @@ import os
 import sys
 from pathlib import Path
 
-from audit_agent import api_map, credentials, planning, store, views, web
+from audit_agent import api_map, api_tasks, batches, credentials, github_issues, planning, store, views, web
 from audit_agent import investigate as investigation
 from audit_agent.inventory import discover
 from audit_agent.inventory.apps import APP_TYPES
@@ -96,6 +96,22 @@ def _parser() -> argparse.ArgumentParser:
     )
     investigate.add_argument("--show-prompt", action="store_true", help="print the prompt and exit without running Claude")
 
+    batch_send = commands.add_parser("batch-send", parents=[common],
+                                     help="send tasks to Claude as a batch: half price, results within 24 hours")
+    batch_send.add_argument("task_ids", type=int, nargs="+")
+    batch_send.add_argument("--model", help="Claude model name (default: the API runner's default)")
+    commands.add_parser("batches", parents=[common], help="list Claude batches and what they're waiting for")
+    commands.add_parser("batch-check", parents=[common], help="check open batches and import finished results")
+    commands.add_parser("batch-recover", parents=[common],
+                        help="find batches this database lost track of on the Anthropic account and import them")
+    batch_cancel = commands.add_parser("batch-cancel", parents=[common], help="cancel a batch in progress")
+    batch_cancel.add_argument("batch_id", type=int)
+
+    issues = commands.add_parser("issues", parents=[common],
+                                 help="preview (or, with --create, create) GitHub issues for a task's findings")
+    issues.add_argument("task_id", type=int)
+    issues.add_argument("--create", action="store_true", help="create the issues and add them to the project board")
+
     findings = commands.add_parser("findings", parents=[common], help="list findings for an audit or a task")
     findings.add_argument("audit_id", type=int, nargs="?")
     findings.add_argument("--task", type=int, help="only findings from this task")
@@ -106,9 +122,15 @@ def _parser() -> argparse.ArgumentParser:
     key.add_argument("--clear", action="store_true", help="delete the saved key")
     key.add_argument("--show", action="store_true", help="show where the key comes from, masked")
 
-    ui = commands.add_parser("ui", parents=[common], help="open a local page to review and cancel tasks")
+    ui = commands.add_parser("ui", parents=[common], help="open a local page to review tasks and send them to Claude")
     ui.add_argument("--port", type=int, default=8765, help="port on 127.0.0.1 (default: 8765)")
     ui.add_argument("--no-browser", action="store_true", help="don't open the page in a browser")
+    ui.add_argument("--parallel", type=int, default=2, help="investigations run at once (default: 2; the page can change it)")
+    ui.add_argument("--runner", choices=investigation.RUNNERS, default="auto",
+                    help="how tasks sent from the page call Claude (default: auto, as for investigate)")
+    ui.add_argument("--model", help="Claude model alias or name for tasks sent from the page")
+    ui.add_argument("--max-turns", type=int, default=40, help="limit on agent turns per task (default: 40)")
+    ui.add_argument("--timeout", type=int, default=900, help="seconds before a task gives up (default: 900)")
     return parser
 
 
@@ -138,10 +160,13 @@ def _start(args: argparse.Namespace, db_path: Path) -> int:
         project_id = store.create_folder_project(conn, str(project_root), audit_ids)
         print(f"Mapping API calls in {project_root} ...", file=sys.stderr)
         api_map.map_project(conn, project_id)
+        api_counts = api_tasks.plan_project(conn, project_id)
         project = store.get_project(conn, project_id)
         print(views.format_apps(views.app_rows(conn, audit_ids)))
         print()
         print(views.format_api_summary(conn, project_id))
+        print(f"\nAPI-call tasks: {api_counts['total']} (one per endpoint each app calls, plus one per call that "
+              "reaches no route). They are listed with each app's tasks.")
         print(f"\nSaved to {db_path} as project {project['name']!r}.")
         print("List any part of an audit with: audit-agent inventory <audit id> --section files|apps|...")
     finally:
@@ -239,7 +264,8 @@ def _app_type(args: argparse.Namespace, conn) -> int:
     print(f"{path} is now {views.TYPE_LABELS[args.type]}; later audits of this folder keep it.")
     for project_id in store.projects_of(conn, changed):
         api_map.map_project(conn, project_id)
-        print(f"Rebuilt the API map of project {store.get_project(conn, project_id)['name']!r}.")
+        api_tasks.plan_project(conn, project_id)
+        print(f"Rebuilt the API map and API-call tasks of project {store.get_project(conn, project_id)['name']!r}.")
     return 0
 
 
@@ -249,6 +275,9 @@ def _map_api(args: argparse.Namespace, conn) -> int:
     if summary["unreadable_files"]:
         print(f"Note: {summary['unreadable_files']} inventoried files could not be read from disk.\n")
     print(views.format_api_summary(conn, project["id"]))
+    counts = api_tasks.plan_project(conn, project["id"])
+    print(f"\nAPI-call tasks: {counts['total']} ({counts['created']} new, {counts['updated']} refreshed, "
+          f"{counts['removed']} removed because their call is gone)")
     return 0
 
 
@@ -291,6 +320,68 @@ def _investigate(args: argparse.Namespace, conn) -> int:
     return 0
 
 
+BATCH_COLUMNS = ["id", "anthropic_id", "status", "round", "model", "request_count", "waiting", "continued",
+                 "succeeded", "errored", "expired", "canceled", "recovered", "created_at", "error"]
+
+
+def _batch_send(args: argparse.Namespace, conn) -> int:
+    result = batches.submit(conn, args.task_ids, args.model)
+    for skipped in result["skipped"]:
+        print(f"Skipped task #{skipped['id']}: {skipped['reason']}")
+    if result["queued"]:
+        print(f"Sent {len(result['queued'])} task(s) in batch(es) {', '.join(f'#{b}' for b in result['batches'])}. "
+              "Collect results with: audit-agent batch-check (or keep `audit-agent ui` open)")
+    return 0
+
+
+def _batches(args: argparse.Namespace, conn) -> int:
+    rows = batches.batch_rows(conn)
+    print(views.format_table(rows, BATCH_COLUMNS))
+    return 0
+
+
+def _batch_check(args: argparse.Namespace, conn) -> int:
+    result = batches.check(conn)
+    print(f"Checked {result['checked']} open batch(es): {result['imported']} imported, {result['in_progress']} still running.")
+    return 0
+
+
+def _batch_recover(args: argparse.Namespace, conn) -> int:
+    result = batches.recover(conn)
+    print(f"Matched {result['matched']} batch(es) sent without a saved id, adopted {result['adopted']} lost batch(es).")
+    if result["unrecognized_in_progress"]:
+        print(f"{result['unrecognized_in_progress']} batch(es) in progress on the account aren't recognized yet; "
+              "run this again after they end to check whether they're ours.")
+    return 0
+
+
+def _batch_cancel(args: argparse.Namespace, conn) -> int:
+    batches.cancel(conn, args.batch_id)
+    print(f"Batch #{args.batch_id} is being cancelled. Requests that already finished will still be imported.")
+    return 0
+
+
+def _issues(args: argparse.Namespace, conn) -> int:
+    if args.create:
+        result = github_issues.create(conn, args.task_id)
+        for item in result["created"]:
+            print(f"Created {item['url']}")
+        for item in result["skipped"]:
+            print(f"Skipped finding #{item['finding_id']}: {item['reason']}")
+        for warning in result["warnings"]:
+            print(f"Warning: {warning}")
+        if result["board"]:
+            print(f"Project board {result['board']['title']!r}: {result['board']['url']}")
+        return 0
+    plan = github_issues.preview(conn, args.task_id)
+    print(f"Task #{args.task_id}: {len(plan['issues'])} finding(s); board {plan['board']!r}\n")
+    for issue in plan["issues"]:
+        state = issue["issue_url"] or issue["problem"] or f"would create in {issue['repo']}"
+        print(f"  #{issue['finding_id']} {issue['title']}\n     labels: {', '.join(issue['labels'])}\n     {state}")
+    print("\nCreate them with: audit-agent issues", args.task_id, "--create")
+    return 0
+
+
 def _findings(args: argparse.Namespace, conn) -> int:
     if args.audit_id is None and args.task is None:
         print("error: give an audit id or --task", file=sys.stderr)
@@ -327,6 +418,12 @@ def _set_api_key(args: argparse.Namespace) -> int:
 
 
 COMMANDS = {
+    "issues": _issues,
+    "batch-send": _batch_send,
+    "batches": _batches,
+    "batch-check": _batch_check,
+    "batch-recover": _batch_recover,
+    "batch-cancel": _batch_cancel,
     "investigate": _investigate,
     "findings": _findings,
     "audits": _audits,
@@ -353,7 +450,10 @@ def main(argv: list[str] | None = None) -> int:
             return _set_api_key(args)
         if args.command == "ui":
             try:
-                web.serve(db_path, args.port, open_browser=not args.no_browser)
+                settings = investigation.AgentSettings(
+                    model=args.model, max_turns=args.max_turns, timeout_s=args.timeout, runner=args.runner
+                )
+                web.serve(db_path, args.port, open_browser=not args.no_browser, settings=settings, parallel=args.parallel)
             except OSError as exc:
                 print(f"error: could not start the page on port {args.port}: {exc.strerror}", file=sys.stderr)
                 return 1
@@ -363,6 +463,7 @@ def main(argv: list[str] | None = None) -> int:
             return COMMANDS[args.command](args, conn)
         finally:
             conn.close()
-    except (RepositoryError, store.StoreError, planning.PlanningError, investigation.InvestigationError) as exc:
+    except (RepositoryError, store.StoreError, planning.PlanningError, investigation.InvestigationError,
+            batches.BatchError, github_issues.IssueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

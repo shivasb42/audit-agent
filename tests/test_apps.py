@@ -191,7 +191,7 @@ class StartFolderTest(unittest.TestCase):
         self.assertEqual(run_cli("start", str(self.folder), "--db", self.db).returncode, 0)
         corrected = run_cli("app-type", "server/client", "mobile", "--db", self.db)
         self.assertEqual(corrected.returncode, 0, corrected.stderr)
-        self.assertIn("Rebuilt the API map of project 'TC'", corrected.stdout)
+        self.assertIn("Rebuilt the API map and API-call tasks of project 'TC'", corrected.stdout)
         self.assertEqual(run_cli("app-type", "nothing/here", "web", "--db", self.db).returncode, 1)
 
         self.assertEqual(run_cli("start", str(self.folder), "--db", self.db).returncode, 0)
@@ -223,8 +223,11 @@ class StartFolderTest(unittest.TestCase):
         client = found["server/client"]
         tasks = review.find_tasks(conn, client["audit_id"], review.TaskFilter(app=client["root"]))
         self.assertEqual(sum(client["task_counts"].values()), len(tasks))
-        self.assertTrue(tasks and all(all(p.startswith("client/") for p in t["files"]) for t in tasks),
+        file_tasks = [t for t in tasks if t["kind"] == "files"]
+        self.assertTrue(file_tasks and all(all(p.startswith("client/") for p in t["files"]) for t in file_tasks),
                         "tasks are grouped by app")
+        self.assertEqual([t["title"] for t in tasks if t["kind"] == "api"], ["API: Web → GET /users/me"],
+                         "the app's API calls are its tasks too")
         backend_tasks = review.find_tasks(conn, client["audit_id"], review.TaskFilter(app="."))
         self.assertFalse(any(p.startswith("client/") for t in backend_tasks for p in t["files"]))
 

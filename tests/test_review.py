@@ -84,7 +84,11 @@ class ReviewTest(ReviewTestCase):
     def test_version_3_database_is_upgraded_without_losing_tasks(self):
         old_path = self.base / "v3.db"
         v3_schema = (
-            store.SCHEMA.replace(store.APP_TABLES, "")
+            store.SCHEMA.replace(store.BATCH_ROUND_TABLES, "")
+            .replace(store.ISSUE_TABLES, "")
+            .replace(store.BATCH_TABLES, "")
+            .replace(store.API_TASK_TABLES, "")
+            .replace(store.APP_TABLES, "")
             .replace(store.FINDING_TABLES, "")
             .replace(store.API_TRACE_TABLES, "")
             .replace(store.API_TABLES, "")

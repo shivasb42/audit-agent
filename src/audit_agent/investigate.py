@@ -203,7 +203,81 @@ def run_claude(prompt: str, repo_root: Path, settings: AgentSettings, secret_pat
     )
 
 
+API_CHECKLIST = """\
+- Method and path: the caller's method and path, including path parameters (names, order, types), match the route
+- Request: the body fields, query parameters, and headers the caller sends match what the handler reads and validates
+  (names, types, required vs optional); nothing the handler needs is missing
+- Authentication and authorization: whether the route requires a logged-in user or a role, whether the caller sends
+  the token, and whether the handler checks that the user may act on the resource it receives by id
+- Response: the fields and shapes the caller uses exist in what the handler returns, including on error; status codes
+  the handler returns are handled by the caller
+- Failure handling on the caller side: network errors, non-2xx responses, timeouts, and retries that could repeat a
+  write
+"""
+
+RULES = """
+Rules:
+- Report only problems you can show in the code. For each finding, quote the exact code (1-10 lines, copied
+  verbatim) from the file at the line you cite, and explain what goes wrong and when.
+- If you suspect a problem but can't show it in the code (it depends on configuration, runtime data, or code you
+  can't see), put it under "needs_review" with what you suspect and why you couldn't confirm it.
+- Don't report style, formatting, naming, performance, missing tests, or TODO comments.
+- If you find nothing, return empty lists. Don't invent problems to have something to report.
+"""
+
+
+def _api_prompt(conn: sqlite3.Connection, task: sqlite3.Row, audit: sqlite3.Row, secrets: list[str]) -> str:
+    detail = json.loads(task["detail"] or "{}")
+    files = store.api_task_files(conn, task["id"])
+    calls = [f"{c['file']}:{c['line']} {c['method']} {c['url']}" + (f" (through {c['via']})" if c.get("via") else "")
+             for c in detail.get("calls", [])]
+    route, closest = detail.get("route"), detail.get("closest")
+    if route:
+        reaches = (f"It reaches {route['method']} {route['path']} in {route['repo']}, declared in {route['file']}"
+                   + (f" and handled in {route['handler']}." if route.get("handler") else "."))
+    elif detail.get("status") == "wrong_method":
+        reaches = (f"No route accepts this method. The path exists as {closest['method']} {closest['path']} in "
+                   f"{closest['repo']}: {closest['handler'] or closest['file']}." if closest else "No route accepts this method.")
+    else:
+        reaches = (f"No backend route matches this call. The closest route is {closest['method']} {closest['path']} in "
+                   f"{closest['repo']}: {closest['handler'] or closest['file']}." if closest
+                   else "No backend route matches this call, and no route is similar.")
+    file_lines = [
+        f"[{f['role']}] {f['repo_name']}: {f['path']} ({f['line_count'] or '?'} lines) at {Path(f['repo_path']) / f['path']}"
+        for f in files
+    ]
+    other_repos = sorted({(f["repo_name"], f["repo_path"]) for f in files if f["audit_id"] != audit["id"]})
+    problem = ""
+    if detail.get("status") in ("broken", "wrong_method"):
+        problem = (
+            "\nThis call reaches no route. Decide whether it is a real bug (the screen or feature fails at runtime) "
+            "or dead code nothing reaches, and what route was intended. Report it as a finding only if you can show "
+            "in the code that the call runs and fails."
+        )
+    parts = [
+        f"You are checking one API call between apps of the same project for real bugs. You can only read files; "
+        f"you cannot run or change anything. The main repository is \"{audit['repo_name']}\" ({audit['repo_path']}).",
+        f"\nTask #{task['id']}: {task['title']}",
+        f"\nThe {detail.get('caller_type', 'unknown')} app \"{detail.get('caller_app', audit['repo_name'])}\" makes this call "
+        f"from {len(calls)} place{'s' if len(calls) != 1 else ''}:\n" + "\n".join(f"  - {c}" for c in calls),
+        f"\n{reaches}",
+        "\nFiles to read (all of them; open others whenever you need context):\n" + "\n".join(f"  - {f}" for f in file_lines),
+        ("\nOther repositories you can read:\n" + "\n".join(f"  - {name}: {path}" for name, path in other_repos))
+        if other_repos else "",
+        f"\nNever open these files in {audit['repo_name']}; they may contain secrets:\n"
+        + "\n".join(f"  - {s}" for s in secrets[:50]) if secrets else "",
+        "\nCheck that both sides agree:\n" + API_CHECKLIST,
+        problem,
+        RULES.rstrip("\n")
+        + "\n- Cite files in the main repository by their path relative to its root, and files in other repositories "
+        "by their absolute path.\n\nReturn your result as JSON with \"findings\" and \"needs_review\" lists.",
+    ]
+    return "\n".join(p for p in parts if p)
+
+
 def build_prompt(conn: sqlite3.Connection, task: sqlite3.Row, audit: sqlite3.Row, secrets: list[str]) -> str:
+    if task["kind"] == "api":
+        return _api_prompt(conn, task, audit, secrets)
     context = store.task_context(conn, task["id"])
 
     def section(title: str, rows: list[str], limit: int = 25) -> str:
@@ -337,6 +411,7 @@ def validate_report(report: dict, roots: dict[str, Path], secrets: set[Path]) ->
                     "title": title,
                     "bug_type": bug_type,
                     "file_path": rel,
+                    "repo_root": root,
                     "line": line,
                     "evidence": evidence,
                     "explanation": explanation,
@@ -351,6 +426,7 @@ def validate_report(report: dict, roots: dict[str, Path], secrets: set[Path]) ->
                 "bug_type": bug_type,
                 "severity": severity if severity in store.SEVERITIES else "medium",
                 "file_path": rel,
+                "repo_root": root,
                 "line": actual,
                 "evidence": evidence,
                 "explanation": explanation,
@@ -396,20 +472,45 @@ def choose_runner(settings: AgentSettings):
     return run_claude
 
 
-def investigate(conn: sqlite3.Connection, task_id: int, settings: AgentSettings | None = None, again: bool = False) -> dict:
-    settings = settings or AgentSettings()
-    task = store.get_task(conn, task_id)
+def runner_label(settings: AgentSettings) -> str:
+    """Which way `choose_runner` will call Claude, without calling it."""
+    from audit_agent import credentials
+
+    if settings.runner == "api" or (settings.runner == "auto" and credentials.get_api_key()):
+        return "Anthropic API (saved key)"
+    return "Claude Code (claude command)"
+
+
+@dataclass
+class TaskScope:
+    """The repositories a task's agent may read and the secret files it must never see."""
+    task: sqlite3.Row
+    audit: sqlite3.Row
+    root: Path
+    audit_roots: dict[int, Path]
+    roots: dict[str, Path]
+    secret_paths: list[Path]
+    own_secrets: list[str]
+
+
+def check_runnable(conn: sqlite3.Connection, task: sqlite3.Row, again: bool = False) -> None:
+    task_id = task["id"]
     if task["status"] == "cancelled":
         raise InvestigationError(f"Task {task_id} is cancelled. Restore it before sending it to Claude.")
     if task["status"] == "running":
         raise InvestigationError(f"Task {task_id} is already running.")
     if task["status"] == "done" and not again:
         raise InvestigationError(f"Task {task_id} is already done. Pass --again to investigate it again.")
+    if store.task_in_open_batch(conn, task_id):
+        raise InvestigationError(f"Task {task_id} is waiting in a Claude batch; its result will be imported from there.")
+
+
+def task_scope(conn: sqlite3.Connection, task_id: int) -> TaskScope:
+    task = store.get_task(conn, task_id)
     audit = store.get_audit(conn, task["audit_id"])
     root = Path(audit["repo_path"])
     if not root.is_dir():
         raise InvestigationError(f"The repository {root} no longer exists.")
-
     # The agent may also read the other repositories in the same project (for example the backend
     # a mobile app calls), so their secret files are denied too.
     audits = [audit, *store.related_audits(conn, audit["id"])]
@@ -420,26 +521,28 @@ def investigate(conn: sqlite3.Connection, task_id: int, settings: AgentSettings 
         f"SELECT audit_id, path FROM inventory_files WHERE category = 'secret' AND audit_id IN ({marks})",
         list(audit_roots),
     ).fetchall()
-    secret_paths = [audit_roots[r["audit_id"]] / r["path"] for r in secret_rows]
-    own_secrets = {r["path"] for r in secret_rows if r["audit_id"] == audit["id"]}
+    return TaskScope(
+        task=task,
+        audit=audit,
+        root=root,
+        audit_roots=audit_roots,
+        roots=roots,
+        secret_paths=[audit_roots[r["audit_id"]] / r["path"] for r in secret_rows],
+        own_secrets=sorted({r["path"] for r in secret_rows if r["audit_id"] == audit["id"]}),
+    )
 
-    prompt = build_prompt(conn, task, audit, sorted(own_secrets))
-    extra_dirs = [p for p in roots.values() if p != root]
-    run_with = choose_runner(settings)
-    before = _repo_state(root)
-    run_id = store.start_run(conn, task_id, GENERAL_AGENT)
-    try:
-        result = run_with(prompt, root, settings, secret_paths, extra_dirs)
-    except InvestigationError as exc:
-        store.finish_run(conn, run_id, task_id, "failed", error=str(exc))
-        raise
-    if _repo_state(root) != before:
-        error = "The repository changed while the agent was running; results were discarded."
-        store.finish_run(conn, run_id, task_id, "failed", error=error, raw_output=result.raw)
-        raise InvestigationError(error)
 
-    findings, needs_review, rejected = validate_report(result.report, roots, {p.resolve() for p in secret_paths})
-    store.save_findings(conn, run_id, task_id, audit["id"], GENERAL_AGENT, findings, needs_review)
+def record_result(conn: sqlite3.Connection, run_id: int, scope: TaskScope, result: AgentResult) -> dict:
+    """Check every citation in the agent's report, save what holds up, and close the run."""
+    task_id = scope.task["id"]
+    findings, needs_review, rejected = validate_report(
+        result.report, scope.roots, {p.resolve() for p in scope.secret_paths}
+    )
+    audit_of_root = {path: audit_id for audit_id, path in scope.audit_roots.items()}
+    for item in findings + needs_review:
+        if "repo_root" in item:
+            item["file_audit_id"] = audit_of_root.get(item.pop("repo_root"))
+    store.save_findings(conn, run_id, task_id, scope.audit["id"], GENERAL_AGENT, findings, needs_review)
     store.finish_run(
         conn, run_id, task_id, "done",
         duration_ms=result.duration_ms, cost_usd=result.cost_usd, num_turns=result.num_turns,
@@ -453,3 +556,30 @@ def investigate(conn: sqlite3.Connection, task_id: int, settings: AgentSettings 
         "cost_usd": result.cost_usd,
         "duration_ms": result.duration_ms,
     }
+
+
+def investigate(conn: sqlite3.Connection, task_id: int, settings: AgentSettings | None = None, again: bool = False) -> dict:
+    settings = settings or AgentSettings()
+    check_runnable(conn, store.get_task(conn, task_id), again)
+    scope = task_scope(conn, task_id)
+    prompt = build_prompt(conn, scope.task, scope.audit, scope.own_secrets)
+    extra_dirs = [p for p in scope.roots.values() if p != scope.root]
+    run_with = choose_runner(settings)
+    before = _repo_state(scope.root)
+    try:
+        run_id = store.start_run(conn, task_id, GENERAL_AGENT)
+    except store.StoreError as exc:
+        raise InvestigationError(str(exc)) from exc
+    try:
+        result = run_with(prompt, scope.root, settings, scope.secret_paths, extra_dirs)
+    except InvestigationError as exc:
+        store.finish_run(conn, run_id, task_id, "failed", error=str(exc))
+        raise
+    except Exception as exc:
+        store.finish_run(conn, run_id, task_id, "failed", error=f"{exc.__class__.__name__}: {exc}")
+        raise InvestigationError(f"{exc.__class__.__name__}: {exc}") from exc
+    if _repo_state(scope.root) != before:
+        error = "The repository changed while the agent was running; results were discarded."
+        store.finish_run(conn, run_id, task_id, "failed", error=error, raw_output=result.raw)
+        raise InvestigationError(error)
+    return record_result(conn, run_id, scope, result)

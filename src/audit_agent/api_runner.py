@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import ssl
 import time
 import urllib.error
 import urllib.request
@@ -188,19 +189,24 @@ class ReadOnlyTools:
 
 def _send(body: dict, api_key: str, timeout: float) -> dict:
     """POST one Messages API request, retrying rate limits and overloads with backoff."""
+    return json.loads(http_request("POST", API_URL, api_key, body, timeout))
+
+
+def http_request(method: str, url: str, api_key: str, body: dict | None = None, timeout: float = 60) -> bytes:
+    """One Anthropic API request, retrying rate limits, overloads, and dropped connections with backoff."""
     if os.environ.get("AUDIT_AGENT_OFFLINE"):
         raise InvestigationError("Network calls are turned off (AUDIT_AGENT_OFFLINE is set).")
-    data = json.dumps(body).encode()
+    data = None if body is None else json.dumps(body).encode()
     for attempt in range(6):
         request = urllib.request.Request(
-            API_URL,
+            url,
             data=data,
-            method="POST",
+            method=method,
             headers={"x-api-key": api_key, "anthropic-version": API_VERSION, "content-type": "application/json"},
         )
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
-                return json.loads(response.read())
+                return response.read()
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:500]
             if exc.code in RETRY_STATUSES and attempt < 5:
@@ -213,6 +219,12 @@ def _send(body: dict, api_key: str, timeout: float) -> dict:
                 ) from exc
             raise InvestigationError(f"The Anthropic API returned {exc.code}: {detail}") from exc
         except urllib.error.URLError as exc:
+            if isinstance(exc.reason, ssl.SSLCertVerificationError):
+                raise InvestigationError(
+                    "Python could not verify api.anthropic.com's certificate, so nothing was sent. On macOS with "
+                    'Python from python.org, run "/Applications/Python 3.13/Install Certificates.command" once '
+                    f"(adjust the version), then try again. ({exc.reason})"
+                ) from exc
             if attempt < 5:
                 time.sleep(2 ** attempt * 5)
                 continue

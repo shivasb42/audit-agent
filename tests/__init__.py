@@ -8,3 +8,5 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 os.environ["AUDIT_AGENT_OFFLINE"] = "1"
 os.environ["AUDIT_AGENT_CREDENTIALS"] = str(Path(__file__).resolve().parent / "no-such-credentials-file")
 os.environ.pop("ANTHROPIC_API_KEY", None)
+# Tests never run the real `gh` either; ones that need it point this at a fake.
+os.environ["AUDIT_AGENT_GH"] = str(Path(__file__).resolve().parent / "no-such-gh")

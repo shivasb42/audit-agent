@@ -233,6 +233,8 @@ def task_detail(conn: sqlite3.Connection, task_id: int) -> dict:
     return {
         "task": dict(task),
         "app": {"name": app["name"], "type": app["type"]} if app else None,
+        "api": json.loads(task["detail"]) if task["kind"] == "api" and task["detail"] else None,
+        "in_batch": store.task_in_open_batch(conn, task_id),
         **context,
         "findings": [dict(r) for r in store.list_findings(conn, task_id=task_id)],
         "runs": [dict(r) for r in store.task_runs(conn, task_id)],
@@ -278,7 +280,7 @@ def project_overview(conn: sqlite3.Connection) -> list[dict]:
     return groups
 
 
-def _closest_route(pattern: str | None, method: str, routes: list[dict]) -> dict | None:
+def closest_route(pattern: str | None, method: str, routes: list[dict]) -> dict | None:
     """The route sharing the longest leading path with the call (a route parameter matches any
     segment; the project's common prefix such as /api may be missing from the call). Ties prefer
     literal matches, then the call's method, then a similar length. A shared common prefix alone
@@ -352,7 +354,7 @@ def api_map_view(conn: sqlite3.Connection, project_id: int) -> dict:
             key = (caller["name"], caller["type"], route["app"]["name"], route["app"]["type"])
             links[key] = links.get(key, 0) + 1
         elif c["status"] in ("broken", "wrong_method"):
-            closest = route or _closest_route(c["pattern"], c["method"], list(routes.values()))
+            closest = route or closest_route(c["pattern"], c["method"], list(routes.values()))
             problems.append({
                 "app": caller["name"], "app_type": caller["type"], "path": c["source_path"], "line": c["line"],
                 "method": c["method"], "url": c["url"], "status": c["status"], "via": c["via"],
@@ -426,10 +428,24 @@ def format_task_detail(data: dict) -> str:
         f"Audit #{task['audit_id']}  status: {task['status']}  priority: {task['priority']} ({task['priority_reason']})",
         "",
         f"Files to audit ({len(data['files'])}, {task['line_count']:,} lines):",
-        *[f"  {f['path']}  ({f['line_count']} lines)" for f in data["files"]],
+        *[
+            f"  {f['repo_name'] + ': ' if 'repo_name' in f else ''}{f['path']}  ({f['line_count']} lines)"
+            + (f"  [{f['role']}]" if "role" in f else "")
+            for f in data["files"]
+        ],
     ]
+    if api := data.get("api"):
+        lines += ["", f"API call from {api['caller_app']} ({api['status']}):"]
+        lines += [f"  {c['file']}:{c['line']}  {c['method']} {c['url']}  ({c['via']})" for c in api["calls"]]
+        target = api["route"] or api["closest"]
+        if target:
+            label = "Reaches" if api["route"] else "Closest route"
+            lines.append(f"  {label}: {target['method']} {target['path']} in {target['repo']}: "
+                         f"{target['handler'] or target['file']}")
 
     def block(title: str, rows: list[dict], render) -> None:
+        if api and not rows:
+            return
         lines.append("")
         lines.append(f"{title} ({len(rows)}):")
         lines.extend(f"  {render(r)}" for r in rows[:25])

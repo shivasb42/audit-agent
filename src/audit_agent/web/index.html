@@ -70,6 +70,8 @@
   .badge.cancelled, .badge.broken, .badge.wrong_method { background: #f9eaea; color: var(--danger); }
   .badge.done { background: #e8f5ee; color: var(--ok); }
   .badge.test { background: #f3eefc; color: #6b46c1; margin-left: 6px; }
+  .badge.api { background: #e6f4f1; color: #0f6e5c; font-weight: 600; }
+  .role { display: inline-block; min-width: 64px; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .03em; }
   aside { padding: 14px 16px; position: sticky; top: 73px; align-self: start; max-height: calc(100vh - 90px); overflow: auto; }
   aside h2 { font-size: 15px; margin: 0 0 4px; }
   aside h3, .api h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 16px 0 6px; }
@@ -87,6 +89,28 @@
   .link-card { border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px; min-width: 240px; }
   .link-card .n { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
   details summary { cursor: pointer; color: var(--accent); font-size: 12px; }
+  button.primary { color: #fff; background: var(--accent); border-color: var(--accent); }
+  .claude-bar { background: #fbfcff; }
+  .claude-bar input[type=number] { width: 56px; padding: 4px 6px; }
+  .run-detail { padding: 0 14px; font-size: 13px; }
+  .run-detail:not(:empty) { padding: 8px 14px 10px; border-bottom: 1px solid var(--line); }
+  .run-detail .item { display: flex; gap: 8px; align-items: baseline; padding: 2px 0; cursor: pointer; }
+  .run-detail .item:hover .t { text-decoration: underline; }
+  .run-detail .t { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .err { color: var(--danger); font-size: 12px; }
+  .badge.running, .badge.queued { background: #fff4dc; color: #8a5a00; }
+  .badge.failed { background: #f9eaea; color: var(--danger); }
+  .badge.waiting { background: #fff4dc; color: #8a5a00; }
+  .badge.in_batch, .badge.in_progress, .badge.submitting, .badge.canceling, .badge.ended { background: #eef1fb; color: #3a4fa0; }
+  .badge.imported { background: #e8f5ee; color: var(--ok); }
+  .finding { border-left: 3px solid var(--danger); padding: 4px 0 6px 10px; margin: 8px 0; }
+  .finding.review { border-left-color: #c79a2a; }
+  .finding .meta { font-size: 12px; color: var(--muted); }
+  .finding pre { margin: 4px 0; padding: 6px 8px; background: #f6f7f9; border-radius: 6px; font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; word-break: break-all; }
+  .sev { font-size: 11px; font-weight: 700; text-transform: uppercase; }
+  .sev.critical, .sev.high { color: var(--danger); }
+  .sev.medium { color: #8a5a00; }
+  .sev.low { color: var(--muted); }
   #toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: #1d2330; color: #fff; padding: 8px 14px; border-radius: 8px; opacity: 0; transition: opacity .2s; }
   #toast.show { opacity: 1; }
   [hidden] { display: none !important; }
@@ -110,6 +134,11 @@
         <div class="counts" id="counts"></div>
         <div class="filters">
           <select id="status"><option value="">Any status</option></select>
+          <select id="kind">
+            <option value="">All tasks</option>
+            <option value="api">API calls only</option>
+            <option value="files">File groups only</option>
+          </select>
           <input id="folder" type="text" placeholder="Folder, e.g. scripts">
           <select id="tests">
             <option value="">Tests and app code</option>
@@ -127,6 +156,27 @@
           <button id="cancel-matching" class="danger">Cancel all matching</button>
           <button id="restore-matching" class="ok">Restore all matching</button>
         </div>
+        <div class="bulk claude-bar">
+          <strong>Claude</strong>
+          <button id="send-selected" class="primary" disabled>Send selected</button>
+          <button id="send-matching" class="primary">Send all pending</button>
+          <label>at a time <input id="parallel" type="number" min="1" max="8" value="2"></label>
+          <span class="spacer"></span>
+          <span id="run-summary"></span>
+          <button id="run-stop" hidden title="Drop queued tasks; running ones finish">Stop queue</button>
+        </div>
+        <div class="run-detail" id="run-detail"></div>
+        <div class="bulk claude-bar">
+          <strong>Batch</strong>
+          <span class="reason">half price, results within 24 hours; you can close the app meanwhile</span>
+          <button id="batch-selected" disabled>Batch selected</button>
+          <button id="batch-matching">Batch all pending</button>
+          <span class="spacer"></span>
+          <span id="batch-summary" class="reason"></span>
+          <button id="batch-check" title="Ask Anthropic now instead of waiting for the next check">Check now</button>
+          <button id="batch-recover" title="List the batches on your Anthropic account and import any this app lost track of">Recover lost batches</button>
+        </div>
+        <div class="run-detail" id="batch-detail"></div>
         <table>
           <thead><tr>
             <th><input type="checkbox" id="select-all" title="Select all shown"></th>
@@ -148,7 +198,8 @@ const TYPE_LABELS = { backend: "Backend", web: "Web", mobile: "Mobile", unknown:
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
 const typeBadge = (t) => `<span class="type ${esc(t)}">${TYPE_LABELS[t] || esc(t)}</span>`;
-const state = { groups: [], app: null, project: null, tab: "tasks", tasks: [], selected: new Set(), openTask: null, apiMap: null };
+const RUNNABLE = ["pending", "failed", "blocked"];
+const state = { groups: [], app: null, project: null, tab: "tasks", tasks: [], selected: new Set(), openTask: null, apiMap: null, run: null, batches: null };
 
 async function api(path, body) {
   const options = body === undefined ? {} : {
@@ -157,18 +208,27 @@ async function api(path, body) {
     body: JSON.stringify(body),
   };
   const res = await fetch(path, options);
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error || res.statusText);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const message = data.error || res.statusText;
+    if (/^no route for \/api\//.test(message)) {
+      throw new Error("The audit-agent ui server is older than this page. Stop it (Ctrl+C) and start it again.");
+    }
+    throw new Error(message);
+  }
   return data;
 }
 
-function toast(text) {
+function toast(text, isError = false) {
   const t = $("toast");
   t.textContent = text;
+  t.style.background = isError ? "var(--danger)" : "";
   t.classList.add("show");
   clearTimeout(toast.timer);
-  toast.timer = setTimeout(() => t.classList.remove("show"), 2200);
+  toast.timer = setTimeout(() => t.classList.remove("show"), isError ? 8000 : 2200);
 }
+
+window.addEventListener("unhandledrejection", (e) => toast(`Error: ${e.reason?.message || e.reason}`, true));
 
 const appKey = (a) => `${a.audit_id}:${a.root ?? ""}`;
 const taskTotal = (a) => Object.values(a.task_counts).reduce((x, y) => x + y, 0);
@@ -176,7 +236,7 @@ const taskTotal = (a) => Object.values(a.task_counts).reduce((x, y) => x + y, 0)
 function filter() {
   return {
     status: $("status").value, folder: $("folder").value.trim(), tests: $("tests").value, search: $("search").value.trim(),
-    app: state.app?.root ?? "",
+    app: state.app?.root ?? "", kind: $("kind").value,
   };
 }
 
@@ -271,19 +331,35 @@ async function loadTasks() {
     STATUSES.map((s) => `<span class="chip ${filter().status === s ? "active" : ""}" data-status="${s}">${s} ${data.counts[s]}</span>`).join("");
   $("matching").textContent = `${data.tasks.length} matching`;
 
-  $("rows").innerHTML = data.tasks.length ? data.tasks.map((t) => `
+  const sent = sentToClaude();
+  $("rows").innerHTML = data.tasks.length ? data.tasks.map((t) => {
+    const runState = sent.get(t.id) || (t.in_batch ? "in_batch" : null);
+    const status = runState && t.status !== "running" ? runState : t.status;
+    let actions = "";
+    if (t.status === "cancelled") actions = `<button class="act" data-action="restore" data-id="${t.id}">Restore</button>`;
+    else if (!runState && RUNNABLE.includes(t.status)) {
+      actions = `<button class="act" data-action="investigate" data-id="${t.id}">Investigate</button>
+                 <button class="act" data-action="cancel" data-id="${t.id}">Cancel</button>`;
+    }
+    if (t.findings_without_issue) {
+      actions += ` <button class="act primary" data-action="issues" data-id="${t.id}">Create GitHub issues (${t.findings_without_issue})</button>`;
+    } else if (t.findings) {
+      actions += ' <span class="reason">issues created</span>';
+    }
+    const findingsBadge = t.findings ? ` <span class="badge broken">${t.findings} finding${t.findings === 1 ? "" : "s"}</span>` : "";
+    return `
     <tr class="row ${t.status} ${state.openTask === t.id ? "selected" : ""}" data-id="${t.id}">
       <td><input type="checkbox" class="pick" data-id="${t.id}" ${state.selected.has(t.id) ? "checked" : ""}></td>
       <td class="num">${t.priority}</td>
-      <td><div class="title">${esc(t.title)}${t.test_only ? '<span class="badge test">test</span>' : ""}</div><div class="reason">${esc(t.priority_reason)}</div></td>
-      <td><span class="badge ${t.status}">${t.status}</span></td>
+      <td><div class="title">${t.kind === "api" ? '<span class="badge api">API</span> ' : ""}${esc(t.title)}${t.test_only ? '<span class="badge test">test</span>' : ""}${findingsBadge}</div><div class="reason">${esc(t.priority_reason)}</div></td>
+      <td><span class="badge ${status}">${status}</span></td>
       <td class="num">${t.file_count}</td>
       <td class="num">${t.line_count.toLocaleString()}</td>
-      <td>${t.status === "cancelled"
-          ? `<button class="act" data-action="restore" data-id="${t.id}">Restore</button>`
-          : ["pending", "blocked", "failed"].includes(t.status)
-            ? `<button class="act" data-action="cancel" data-id="${t.id}">Cancel</button>` : ""}</td>
-    </tr>`).join("") : '<tr><td colspan="7" class="empty">No tasks match these filters.</td></tr>';
+      <td style="white-space:nowrap">${actions}</td>
+    </tr>`;
+  }).join("") : '<tr><td colspan="7" class="empty">No tasks match these filters.</td></tr>';
+  $("send-matching").disabled = $("batch-matching").disabled =
+    !data.tasks.some((t) => t.status === "pending" && !sent.has(t.id) && !t.in_batch);
 
   $("gaps").innerHTML = data.not_covered.length
     ? `Not covered by any task in ${esc(state.app.repo_name)}: ` + data.not_covered.map((g) => `${esc(g.what)} (${g.file_count} files)`).join(", ")
@@ -293,7 +369,8 @@ async function loadTasks() {
 
 function updateSelection() {
   $("selection").textContent = `${state.selected.size} selected`;
-  $("cancel-selected").disabled = $("restore-selected").disabled = state.selected.size === 0;
+  $("cancel-selected").disabled = $("restore-selected").disabled = $("send-selected").disabled =
+    $("batch-selected").disabled = state.selected.size === 0;
   $("select-all").checked = state.tasks.length > 0 && state.tasks.every((t) => state.selected.has(t.id));
 }
 
@@ -307,7 +384,14 @@ async function showTask(id) {
   $("detail").innerHTML = `
     <h2>${esc(d.task.title)}</h2>
     <div class="reason">${d.app ? `${typeBadge(d.app.type)} ${esc(d.app.name)} &middot; ` : ""}Task #${d.task.id} &middot; ${d.task.status} &middot; priority ${d.task.priority} (${esc(d.task.priority_reason)})</div>
-    <h3>Files to audit (${d.files.length})</h3>${list(d.files, (f) => `<code>${esc(f.path)}</code> <span class="reason">${f.line_count} lines</span>`, 100)}
+    ${d.api ? apiCallSection(d.api) : ""}
+    <h3>Files to audit (${d.files.length})</h3>${list(d.files, (f) => `${f.role ? `<span class="role">${esc(f.role)}</span> ` : ""}${f.repo_name && d.api ? `<span class="reason">${esc(f.repo_name)}:</span> ` : ""}<code>${esc(f.path)}</code> <span class="reason">${f.line_count ?? "?"} lines</span>`, 100)}
+    ${d.api ? "" : fileTaskSections(d, list)}
+    ${claudeSection(d)}`;
+}
+
+function fileTaskSections(d, list) {
+  return `
     <h3>Entry points (${d.entry_points.length})</h3>${list(d.entry_points, (e) => `<code>${esc(e.path)}</code> <span class="reason">${esc(e.kind)}</span>`)}
     <h3>Imports of missing files (${d.unresolved.length})</h3>${list(d.unresolved, (u) => `<code>${esc(u.path)}:${u.line}</code> ${esc(u.specifier)}`)}
     <h3>Imports from elsewhere (${d.imports.length})</h3>${list(d.imports, (r) => `<code>${esc(r.path)}</code>`)}
@@ -320,6 +404,183 @@ async function showTask(id) {
       return `${where} <strong style="color:var(--danger)">${esc(c.status)}</strong>`;
     })}
     <h3>API routes handled here (${d.api_routes.length})</h3>${list(d.api_routes, (r) => `<code>${esc(r.method)} ${esc(r.path)}</code> <span class="reason">${r.callers} callers</span>`)}`;
+}
+
+function apiCallSection(api) {
+  const target = api.route || api.closest;
+  const where = target
+    ? `${api.route ? "Reaches" : api.status === "wrong_method" ? "Path exists only as" : "Closest route"}
+       <code>${esc(target.method)} ${esc(target.path)}</code> in <span class="reason">${esc(target.repo)}:</span> <code>${esc(target.handler || target.file)}</code>`
+    : "No backend route matches, and none is similar.";
+  const problem = api.status === "broken" ? '<span class="badge broken">no route with this path</span>'
+    : api.status === "wrong_method" ? '<span class="badge wrong_method">wrong method</span>' : "";
+  return `<h3>The API call ${problem}</h3>
+    <div>${typeBadge(api.caller_type)} ${esc(api.caller_app)} calls it from ${api.calls.length} place${api.calls.length === 1 ? "" : "s"}:</div>
+    <ul>${api.calls.map((c) => `<li><code>${esc(c.file)}:${c.line}</code> <code>${esc(c.method)} ${esc(c.url)}</code>
+      ${c.via ? `<span class="reason">${esc(c.via)}</span>` : ""}</li>`).join("")}</ul>
+    <div style="margin-top:6px">${where}</div>`;
+}
+
+function claudeSection(d) {
+  const sent = sentToClaude().get(d.task.id) || (d.in_batch ? "waiting in a batch (results within 24 hours)" : null);
+  const button = !sent && RUNNABLE.includes(d.task.status)
+    ? `<button class="primary act-detail" data-action="investigate" data-id="${d.task.id}">Send to Claude</button>` : "";
+  const runs = d.runs.length
+    ? `<ul>${d.runs.map((r) => `<li><span class="badge ${r.status}">${r.status}</span> ${esc(r.agent)} agent &middot; ${esc(r.started_at)}
+        ${r.duration_ms ? ` &middot; ${Math.round(r.duration_ms / 1000)}s` : ""}${r.cost_usd != null ? ` &middot; $${r.cost_usd.toFixed(2)}` : ""}
+        ${r.error ? `<div class="err">${esc(r.error)}</div>` : ""}</li>`).join("")}</ul>`
+    : '<div class="reason">Not investigated yet.</div>';
+  const findings = d.findings.filter((f) => f.kind === "finding");
+  const review = d.findings.filter((f) => f.kind === "needs_review");
+  const issueLink = (f) => f.issue_url ? ` <a href="${esc(f.issue_url)}" target="_blank" rel="noopener">GitHub issue &#8599;</a>` : "";
+  const findingHtml = findings.map((f) => `<div class="finding">
+      <div><span class="sev ${esc(f.severity)}">${esc(f.severity)}</span> ${esc(f.bug_type)}: <strong>${esc(f.title)}</strong>${issueLink(f)}</div>
+      <div class="meta">${f.file_audit_id && f.file_audit_id !== f.audit_id ? `${esc(f.file_repo)}: ` : ""}<code>${esc(f.file_path)}:${f.line}</code> &middot; ${esc(f.agent)} agent</div>
+      ${f.evidence ? `<pre>${esc(f.evidence)}</pre>` : ""}
+      <div>${esc(f.explanation)}</div></div>`).join("");
+  const reviewHtml = review.map((n) => `<div class="finding review">
+      <div><strong>${esc(n.title)}</strong>${issueLink(n)}</div>
+      ${n.file_path ? `<div class="meta">${n.file_audit_id && n.file_audit_id !== n.audit_id ? `${esc(n.file_repo)}: ` : ""}<code>${esc(n.file_path)}:${n.line ?? ""}</code></div>` : ""}
+      <div>${esc(n.explanation)}</div>
+      <div class="meta">Not confirmed because: ${esc(n.why_unconfirmed || "not stated")}</div></div>`).join("");
+  return `
+    <h3>Claude ${button}</h3>
+    ${sent ? `<div class="reason">Sent to Claude: ${esc(sent)}</div>` : ""}
+    ${runs}
+    ${d.findings.some((f) => !f.issue_url)
+      ? `<div style="margin-top:12px"><button class="issues-btn" data-id="${d.task.id}">Create GitHub issues (${d.findings.filter((f) => !f.issue_url).length})</button>
+         <span class="reason">for this task's findings and items to review</span></div>` : ""}
+    <h3>Findings (${findings.length})</h3>${findingHtml || '<div class="reason">none</div>'}
+    <h3>Needs your review (${review.length}), not counted as bugs</h3>${reviewHtml || '<div class="reason">none</div>'}`;
+}
+
+// Sending tasks to Claude
+
+function sentToClaude() {
+  const sent = new Map();
+  const r = state.run;
+  if (!r) return sent;
+  r.queued.forEach((t) => sent.set(t.id, "queued"));
+  r.waiting.forEach((t) => sent.set(t.id, "waiting"));
+  r.running.forEach((t) => sent.set(t.id, "running"));
+  return sent;
+}
+
+function renderRun() {
+  const r = state.run;
+  if (!r) return;
+  if (document.activeElement !== $("parallel")) $("parallel").value = r.parallel;
+  const parts = [];
+  if (r.running.length) parts.push(`${r.running.length} running`);
+  if (r.queued.length) parts.push(`${r.queued.length} queued`);
+  if (r.waiting.length) parts.push(`${r.waiting.length} waiting on a rate limit`);
+  const done = r.finished.filter((f) => f.status === "done").length;
+  const failed = r.finished.length - done;
+  if (r.finished.length) parts.push(`${done} finished${failed ? `, ${failed} failed` : ""} this session`);
+  $("run-summary").innerHTML = `<span class="reason">${esc(r.runner)}${parts.length ? " &middot; " + esc(parts.join(", ")) : ""}</span>`;
+  $("run-stop").hidden = !(r.queued.length || r.waiting.length);
+  const item = (t, badge, extra = "") => `<div class="item" data-id="${t.id}"><span class="badge ${badge}">${badge}</span>
+    <span class="t">#${t.id} ${esc(t.title)}</span>${extra}</div>`;
+  const finished = r.finished.slice(0, 5).map((f) => item(f, f.status === "done" ? "done" : "failed",
+    f.status === "done"
+      ? `<span class="reason">${f.findings ?? 0} findings, ${f.needs_review ?? 0} to review${f.cost_usd != null ? `, $${f.cost_usd.toFixed(2)}` : ""}</span>`
+      : `<span class="err">${esc((f.error || "").slice(0, 160))}</span>`));
+  $("run-detail").innerHTML = [
+    ...r.running.map((t) => item(t, "running")),
+    ...r.waiting.map((t) => item(t, "waiting", `<span class="reason">${esc(t.reason)}</span>`)),
+    ...(r.queued.length ? [`<div class="reason">${r.queued.length} queued: ${r.queued.slice(0, 6).map((t) => `#${t.id}`).join(", ")}${r.queued.length > 6 ? "…" : ""}</div>`] : []),
+    ...finished,
+  ].join("");
+}
+
+async function pollRun() {
+  clearTimeout(pollRun.timer);
+  const before = state.run;
+  state.run = await api("/api/run");
+  renderRun();
+  const changed = !before || before.finished.length !== state.run.finished.length
+    || before.running.length !== state.run.running.length || before.active !== state.run.active;
+  if (changed && before) {
+    await loadTasks();
+    state.groups = await api("/api/projects");
+    renderSidebar();
+    if (state.openTask) await showTask(state.openTask);
+  }
+  if (state.run.active) pollRun.timer = setTimeout(() => pollRun().catch(() => {}), 2000);
+}
+
+// Batches
+
+function renderBatches(b) {
+  state.batches = b;
+  const open = b.batches.filter((x) => ["submitting", "in_progress", "canceling", "ended"].includes(x.status));
+  const waiting = open.reduce((n, x) => n + x.waiting, 0);
+  $("batch-summary").textContent = !b.available
+    ? "needs an Anthropic API key (audit-agent set-api-key)"
+    : open.length ? `${open.length} open, ${waiting} task${waiting === 1 ? "" : "s"} waiting${b.last_checked ? `, checked ${b.last_checked.slice(11, 16)} UTC` : ""}`
+      : b.batches.length ? "no open batches" : "";
+  $("batch-selected").title = $("batch-matching").title = b.available ? "" : "Batches need an Anthropic API key";
+  const row = (x) => `<div class="item" style="cursor:default"><span class="badge ${x.status}">${x.status.replace("_", " ")}</span>
+    <span class="t">#${x.id} ${esc(x.anthropic_id || "not confirmed yet")}${x.round > 1 ? ` &middot; round ${x.round}` : ""} &middot; ${x.request_count} task${x.request_count === 1 ? "" : "s"}
+      ${x.continued ? `&middot; ${x.continued} went on to round ${(x.round || 1) + 1} with more files` : ""}
+      ${x.waiting ? `&middot; ${x.waiting} waiting` : ""} ${x.succeeded ? `&middot; ${x.succeeded} answered` : ""}
+      ${x.errored ? `&middot; ${x.errored} errored` : ""} ${x.expired ? `&middot; ${x.expired} expired` : ""}
+      ${x.recovered ? "&middot; recovered" : ""}</span>
+    ${x.error ? `<span class="err">${esc(x.error)}</span>` : ""}
+    ${x.status === "in_progress" ? `<button class="batch-cancel" data-id="${x.id}">Cancel</button>` : ""}</div>`;
+  $("batch-detail").innerHTML = [
+    ...(b.last_error ? [`<div class="err">Last check failed: ${esc(b.last_error)}</div>`] : []),
+    ...b.batches.slice(0, 6).map(row),
+  ].join("");
+}
+
+async function pollBatches() {
+  clearTimeout(pollBatches.timer);
+  const before = state.batches;
+  const b = await api("/api/batches");
+  renderBatches(b);
+  const signature = (x) => x ? x.batches.map((y) => `${y.id}:${y.status}:${y.waiting}`).join(",") : "";
+  if (before && signature(before) !== signature(b)) {
+    await loadTasks();
+    state.groups = await api("/api/projects");
+    renderSidebar();
+    if (state.openTask) await showTask(state.openTask);
+  }
+  const open = b.batches.some((x) => ["submitting", "in_progress", "canceling", "ended"].includes(x.status));
+  if (open) pollBatches.timer = setTimeout(() => pollBatches().catch(() => {}), 30000);
+}
+
+async function sendBatch(body, count) {
+  if (state.batches && !state.batches.available) return toast("Batches need an Anthropic API key: run audit-agent set-api-key", true);
+  if (!confirm(`Send ${count} task${count === 1 ? "" : "s"} to Claude as a batch?\n\n` +
+      "Half the price of sending them live. Results arrive within 24 hours, usually much sooner. " +
+      "Each task goes in as one request with its files' code included, and is checked like a live run. " +
+      "You can close the app; results are collected the next time it runs.")) return;
+  const res = await api("/api/batches", body);
+  const skipped = res.result.skipped.length
+    ? ` (${res.result.skipped.length} skipped: ${[...new Set(res.result.skipped.map((s) => s.reason))].join("; ")})` : "";
+  toast(`Sent ${res.result.queued.length} task${res.result.queued.length === 1 ? "" : "s"} as a batch${skipped}`);
+  state.selected.clear();
+  renderBatches(res);
+  await loadTasks();
+  pollBatches().catch(() => {});
+}
+
+async function sendToClaude(body, count) {
+  const parallel = Number($("parallel").value) || 1;
+  const runner = state.run ? state.run.runner : "Claude";
+  if (!confirm(`Send ${count} task${count === 1 ? "" : "s"} to Claude?\n\n` +
+      `Each task is a separate read-only investigation using ${runner}, ${parallel} at a time. ` +
+      `Each one uses your Claude usage.`)) return;
+  const res = await api("/api/run", { ...body, parallel });
+  const skipped = res.skipped.length ? ` (${res.skipped.length} skipped: ${[...new Set(res.skipped.map((s) => s.reason))].join(", ")})` : "";
+  toast(`Sent ${res.queued.length} task${res.queued.length === 1 ? "" : "s"} to Claude${skipped}`);
+  state.selected.clear();
+  state.run = res.status;
+  renderRun();
+  await loadTasks();
+  if (state.openTask) await showTask(state.openTask);
+  pollRun().catch(() => {});
 }
 
 async function change(action, ids) {
@@ -447,7 +708,7 @@ $("tab-tasks").addEventListener("click", () => {
 $("tab-api").addEventListener("click", () => { if (state.project?.id) showApiMap(state.project); });
 let typing;
 for (const id of ["folder", "search"]) $(id).addEventListener("input", () => { clearTimeout(typing); typing = setTimeout(loadTasks, 200); });
-for (const id of ["status", "tests"]) $(id).addEventListener("change", loadTasks);
+for (const id of ["status", "tests", "kind"]) $(id).addEventListener("change", loadTasks);
 $("status").innerHTML += STATUSES.map((s) => `<option value="${s}">${s}</option>`).join("");
 $("counts").addEventListener("click", (e) => {
   const chip = e.target.closest(".chip");
@@ -463,9 +724,97 @@ $("rows").addEventListener("click", (e) => {
     return updateSelection();
   }
   const act = e.target.closest(".act");
+  if (act && act.dataset.action === "investigate") return sendToClaude({ ids: [Number(act.dataset.id)] }, 1);
+  if (act && act.dataset.action === "issues") return createIssues(Number(act.dataset.id), act);
   if (act) return change(act.dataset.action, [Number(act.dataset.id)]);
   const row = e.target.closest("tr.row");
   if (row) showTask(Number(row.dataset.id));
+});
+$("detail").addEventListener("click", (e) => {
+  const act = e.target.closest(".act-detail");
+  if (act) sendToClaude({ ids: [Number(act.dataset.id)] }, 1);
+  const issues = e.target.closest(".issues-btn");
+  if (issues) createIssues(Number(issues.dataset.id), issues);
+});
+
+async function createIssues(taskId, button) {
+  const plan = await api(`/api/tasks/${taskId}/issues`);
+  const todo = plan.issues.filter((i) => !i.issue_url && !i.problem);
+  const blocked = plan.issues.filter((i) => !i.issue_url && i.problem);
+  if (!todo.length) return toast(blocked.length ? `Can't create issues: ${blocked[0].problem}` : "Every finding already has an issue", true);
+  const lines = todo.map((i) => `• ${i.title}\n   → ${i.repo}  [${i.labels.join(", ")}]`).join("\n");
+  if (!confirm(`Create ${todo.length} GitHub issue${todo.length === 1 ? "" : "s"}?\n\n${lines}\n\n` +
+      `They'll be added to your public project board "${plan.board}" (created if it doesn't exist). ` +
+      `People see them only if they have access to the repositories.` +
+      (blocked.length ? `\n\nSkipped: ${blocked.map((i) => i.problem).join("; ")}` : ""))) return;
+  button.disabled = true;
+  button.textContent = "Creating issues…";
+  try {
+    const res = await api(`/api/tasks/${taskId}/issues`, { finding_ids: todo.map((i) => i.finding_id) });
+    toast(`Created ${res.created.length} issue${res.created.length === 1 ? "" : "s"}` +
+          (res.board ? ` on "${res.board.title}"` : "") + (res.warnings.length ? ` (${res.warnings.length} warning)` : ""),
+          res.warnings.length > 0);
+  } finally {
+    await loadTasks();
+    await showTask(taskId);
+  }
+}
+$("run-detail").addEventListener("click", (e) => {
+  const item = e.target.closest(".item");
+  if (item) showTask(Number(item.dataset.id));
+});
+$("send-selected").addEventListener("click", () => {
+  const ids = [...state.selected];
+  if (ids.length) sendToClaude({ ids }, ids.length);
+});
+$("send-matching").addEventListener("click", () => {
+  const sent = sentToClaude();
+  const count = state.tasks.filter((t) => t.status === "pending" && !sent.has(t.id)).length;
+  if (count) sendToClaude({ audit_id: state.app.audit_id, filter: filter() }, count);
+});
+$("parallel").addEventListener("change", async () => {
+  const parallel = Number($("parallel").value);
+  if (!(parallel >= 1 && parallel <= 8)) return toast("Choose between 1 and 8 at a time");
+  state.run = (await api("/api/run", { ids: [], parallel })).status;
+  renderRun();
+});
+$("batch-selected").addEventListener("click", () => {
+  const ids = [...state.selected];
+  if (ids.length) sendBatch({ ids }, ids.length);
+});
+$("batch-matching").addEventListener("click", () => {
+  const sent = sentToClaude();
+  const count = state.tasks.filter((t) => t.status === "pending" && !sent.has(t.id) && !t.in_batch).length;
+  if (count) sendBatch({ audit_id: state.app.audit_id, filter: filter() }, count);
+});
+$("batch-check").addEventListener("click", async () => {
+  const res = await api("/api/batches/check", {});
+  renderBatches(res);
+  toast(`Checked ${res.result.checked} batch${res.result.checked === 1 ? "" : "es"}: ${res.result.imported} imported`);
+  await loadTasks();
+  pollBatches().catch(() => {});
+});
+$("batch-recover").addEventListener("click", async () => {
+  const res = await api("/api/batches/recover", {});
+  renderBatches(res);
+  const r = res.result;
+  toast(`Recovered ${r.matched + r.adopted} batch${r.matched + r.adopted === 1 ? "" : "es"}` +
+        (r.unrecognized_in_progress ? `; ${r.unrecognized_in_progress} still running elsewhere on the account` : ""));
+  await loadTasks();
+});
+$("batch-detail").addEventListener("click", async (e) => {
+  const button = e.target.closest(".batch-cancel");
+  if (!button || !confirm("Cancel this batch? Requests that already finished are still imported.")) return;
+  renderBatches(await api(`/api/batches/${button.dataset.id}/cancel`, {}));
+  pollBatches().catch(() => {});
+});
+$("run-stop").addEventListener("click", async () => {
+  if (!confirm("Drop the queued tasks? Investigations already running will finish.")) return;
+  const res = await api("/api/run/stop", {});
+  toast(`Dropped ${res.dropped} queued task${res.dropped === 1 ? "" : "s"}`);
+  state.run = res.status;
+  renderRun();
+  await loadTasks();
 });
 $("select-all").addEventListener("change", (e) => {
   state.tasks.forEach((t) => e.target.checked ? state.selected.add(t.id) : state.selected.delete(t.id));
@@ -476,7 +825,14 @@ $("restore-selected").addEventListener("click", () => change("restore", [...stat
 $("cancel-matching").addEventListener("click", () => changeMatching("cancel"));
 $("restore-matching").addEventListener("click", () => changeMatching("restore"));
 
-loadGroups().catch((err) => { $("rows").innerHTML = `<tr><td colspan="7" class="empty">${esc(err.message)}</td></tr>`; });
+pollBatches().catch(() => {});
+pollRun()
+  .catch((err) => {
+    $("run-summary").innerHTML = `<span class="err">${esc(err.message)}</span>`;
+    $("send-selected").disabled = $("send-matching").disabled = true;
+  })
+  .then(loadGroups)
+  .catch((err) => { $("rows").innerHTML = `<tr><td colspan="7" class="empty">${esc(err.message)}</td></tr>`; });
 </script>
 </body>
 </html>

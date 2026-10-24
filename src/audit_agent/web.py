@@ -1,5 +1,6 @@
 """Local review page: `audit-agent ui` serves projects, their apps and task queues, and each
-project's API map on 127.0.0.1 only. Everything shown is read from the audit database.
+project's API map on 127.0.0.1 only. Everything shown is read from the audit database. The page
+can also send tasks to Claude (see runner), which investigates them with read-only tools.
 
 Write requests must send the `X-Audit-Agent` header and a JSON body. Browsers will not send a
 custom header cross-origin without a CORS preflight, which this server never approves, so other
@@ -11,13 +12,17 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import threading
+import traceback
 import webbrowser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from audit_agent import review, store, views
+from audit_agent import batches, credentials, github_issues, review, store, views
+from audit_agent.investigate import AgentSettings, InvestigationError
+from audit_agent.runner import Runner, print_log
 
 PAGE = Path(__file__).with_name("web") / "index.html"
 WRITE_HEADER = "X-Audit-Agent"
@@ -38,7 +43,7 @@ def _filter_from(params: dict) -> review.TaskFilter:
         return value or None
 
     try:
-        return review.TaskFilter(one("status"), one("folder"), one("tests"), one("search"), one("app"))
+        return review.TaskFilter(one("status"), one("folder"), one("tests"), one("search"), one("app"), one("kind"))
     except ValueError as exc:
         raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
 
@@ -77,38 +82,117 @@ def _audit_tasks(conn: sqlite3.Connection, audit_id: int, params: dict) -> dict:
     counts = {s: 0 for s in store.TASK_STATUSES}
     for task in everything:
         counts[task["status"]] += 1
+    in_batch = store.batched_task_ids(conn)
+    found = {
+        r["task_id"]: (r["n"], r["without_issue"])
+        for r in conn.execute(
+            """SELECT f.task_id, COUNT(*) AS n, SUM(f.issue_url IS NULL) AS without_issue
+               FROM findings f JOIN audit_tasks t ON t.id = f.task_id WHERE t.audit_id = ? GROUP BY f.task_id""",
+            (audit_id,),
+        )
+    }
     return {
         "audit_id": audit_id,
         "total": len(everything),
         "counts": counts,
         "tasks": [
-            {k: t[k] for k in ("id", "title", "status", "priority", "priority_reason", "line_count", "file_count",
-                               "test_only", "app_root")}
+            {**{k: t[k] for k in ("id", "title", "status", "priority", "priority_reason", "line_count", "file_count",
+                                  "test_only", "app_root", "kind")},
+             "in_batch": t["id"] in in_batch,
+             "findings": found.get(t["id"], (0, 0))[0],
+             "findings_without_issue": found.get(t["id"], (0, 0))[1]}
             for t in tasks
         ],
         "not_covered": [dict(r) for r in store.not_covered(conn, audit_id)],
     }
 
 
+def _send_to_claude(server: "ReviewServer", body: dict) -> dict:
+    """Queue tasks for Claude: the given ids, or every pending task in an audit matching a filter."""
+    if "parallel" in body:
+        try:
+            server.runner.set_parallel(int(body["parallel"]))
+        except (TypeError, ValueError) as exc:
+            raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+    if isinstance(body.get("audit_id"), int):
+        result = server.runner.submit_matching(body["audit_id"], _filter_from(body.get("filter") or {}))
+    else:
+        result = server.runner.submit(_ids(body))
+    return {**result, "status": server.runner.status()}
+
+
+def _batch_status(server: "ReviewServer", conn: sqlite3.Connection) -> dict:
+    return {
+        "available": credentials.get_api_key() is not None,
+        "batches": batches.batch_rows(conn),
+        "last_checked": server.poller.last_checked,
+        "last_error": server.poller.last_error,
+    }
+
+
+def _batch_call(server: "ReviewServer", conn: sqlite3.Connection, action) -> dict:
+    try:
+        result = action()
+    except batches.BatchError as exc:
+        raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+    except InvestigationError as exc:
+        raise ApiError(HTTPStatus.BAD_GATEWAY, str(exc)) from exc
+    return {"result": result, **_batch_status(server, conn)}
+
+
+def _send_batch(server: "ReviewServer", conn: sqlite3.Connection, body: dict) -> dict:
+    if isinstance(body.get("audit_id"), int):
+        found = review.find_tasks(conn, body["audit_id"], _filter_from(body.get("filter") or {}))
+        ids = [t["id"] for t in found if t["status"] == "pending"]
+    else:
+        ids = _ids(body)
+    return _batch_call(server, conn, lambda: batches.submit(
+        conn, ids, server.runner.settings.model, exclude=server.runner.busy_ids(), log=server.runner.log
+    ))
+
+
+def _create_issues(server: "ReviewServer", conn: sqlite3.Connection, task_id: int, body: dict) -> dict:
+    finding_ids = body.get("finding_ids")
+    if finding_ids is not None and (not isinstance(finding_ids, list) or not all(isinstance(i, int) for i in finding_ids)):
+        raise ApiError(HTTPStatus.BAD_REQUEST, "finding_ids must be a list of finding ids")
+    try:
+        result = github_issues.create(conn, task_id, finding_ids, log=server.runner.log)
+    except github_issues.IssueError as exc:
+        raise ApiError(HTTPStatus.BAD_GATEWAY, str(exc)) from exc
+    return {**result, "preview": github_issues.preview(conn, task_id)}
+
+
 ROUTES_GET = [
-    (re.compile(r"^/api/projects$"), lambda conn, m, q: views.project_overview(conn)),
-    (re.compile(r"^/api/projects/(\d+)/api-map$"), lambda conn, m, q: views.api_map_view(conn, int(m[1]))),
-    (re.compile(r"^/api/audits$"), lambda conn, m, q: _audits(conn)),
-    (re.compile(r"^/api/audits/(\d+)/tasks$"), lambda conn, m, q: _audit_tasks(conn, int(m[1]), q)),
-    (re.compile(r"^/api/tasks/(\d+)$"), lambda conn, m, q: views.task_detail(conn, int(m[1]))),
+    (re.compile(r"^/api/tasks/(\d+)/issues$"), lambda s, conn, m, q: github_issues.preview(conn, int(m[1]))),
+    (re.compile(r"^/api/batches$"), lambda s, conn, m, q: _batch_status(s, conn)),
+    (re.compile(r"^/api/projects$"), lambda s, conn, m, q: views.project_overview(conn)),
+    (re.compile(r"^/api/projects/(\d+)/api-map$"), lambda s, conn, m, q: views.api_map_view(conn, int(m[1]))),
+    (re.compile(r"^/api/audits$"), lambda s, conn, m, q: _audits(conn)),
+    (re.compile(r"^/api/audits/(\d+)/tasks$"), lambda s, conn, m, q: _audit_tasks(conn, int(m[1]), q)),
+    (re.compile(r"^/api/tasks/(\d+)$"), lambda s, conn, m, q: views.task_detail(conn, int(m[1]))),
+    (re.compile(r"^/api/run$"), lambda s, conn, m, q: s.runner.status()),
 ]
 
 ROUTES_POST = [
-    (re.compile(r"^/api/tasks/cancel$"), lambda conn, m, b: {"changed": review.cancel_tasks(conn, _ids(b))}),
-    (re.compile(r"^/api/tasks/restore$"), lambda conn, m, b: {"changed": review.restore_tasks(conn, _ids(b))}),
+    (re.compile(r"^/api/tasks/cancel$"), lambda s, conn, m, b: {"changed": review.cancel_tasks(conn, _ids(b))}),
+    (re.compile(r"^/api/tasks/restore$"), lambda s, conn, m, b: {"changed": review.restore_tasks(conn, _ids(b))}),
     (
         re.compile(r"^/api/audits/(\d+)/cancel$"),
-        lambda conn, m, b: {"changed": review.cancel_matching(conn, int(m[1]), _filter_from(b.get("filter") or {}))},
+        lambda s, conn, m, b: {"changed": review.cancel_matching(conn, int(m[1]), _filter_from(b.get("filter") or {}))},
     ),
     (
         re.compile(r"^/api/audits/(\d+)/restore$"),
-        lambda conn, m, b: {"changed": review.restore_matching(conn, int(m[1]), _filter_from(b.get("filter") or {}))},
+        lambda s, conn, m, b: {"changed": review.restore_matching(conn, int(m[1]), _filter_from(b.get("filter") or {}))},
     ),
+    (re.compile(r"^/api/run$"), lambda s, conn, m, b: _send_to_claude(s, b)),
+    (re.compile(r"^/api/run/stop$"), lambda s, conn, m, b: {"dropped": s.runner.stop(), "status": s.runner.status()}),
+    (re.compile(r"^/api/tasks/(\d+)/issues$"), lambda s, conn, m, b: _create_issues(s, conn, int(m[1]), b)),
+    (re.compile(r"^/api/batches$"), lambda s, conn, m, b: _send_batch(s, conn, b)),
+    (re.compile(r"^/api/batches/check$"), lambda s, conn, m, b: _batch_call(s, conn, s.poller.check_now)),
+    (re.compile(r"^/api/batches/recover$"),
+     lambda s, conn, m, b: _batch_call(s, conn, lambda: batches.recover(conn, log=s.runner.log))),
+    (re.compile(r"^/api/batches/(\d+)/cancel$"),
+     lambda s, conn, m, b: _batch_call(s, conn, lambda: batches.cancel(conn, int(m[1]), log=s.runner.log))),
 ]
 
 
@@ -134,20 +218,27 @@ class ReviewHandler(BaseHTTPRequestHandler):
         port = self.server.server_address[1]
         return self.headers.get("Host", "") in {f"127.0.0.1:{port}", f"localhost:{port}"}
 
+    def _fail(self, status: HTTPStatus, message: str) -> None:
+        print_log(f"{self.command} {self.path} -> {status.value}: {message}")
+        self._json(status, {"error": message})
+
     def _dispatch(self, routes, path: str, payload) -> None:
         for pattern, handler in routes:
             if match := pattern.match(path):
                 conn = store.connect(self.server.db_path)
                 try:
-                    self._json(HTTPStatus.OK, handler(conn, match, payload))
+                    self._json(HTTPStatus.OK, handler(self.server, conn, match, payload))
                 except ApiError as exc:
-                    self._json(exc.status, {"error": str(exc)})
+                    self._fail(exc.status, str(exc))
                 except store.StoreError as exc:
-                    self._json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+                    self._fail(HTTPStatus.NOT_FOUND, str(exc))
+                except Exception as exc:
+                    traceback.print_exc()
+                    self._fail(HTTPStatus.INTERNAL_SERVER_ERROR, f"{exc.__class__.__name__}: {exc}")
                 finally:
                     conn.close()
                 return
-        self._json(HTTPStatus.NOT_FOUND, {"error": f"no route for {path}"})
+        self._fail(HTTPStatus.NOT_FOUND, f"no route for {path}")
 
     def do_GET(self) -> None:  # noqa: N802
         if not self._host_allowed():
@@ -179,8 +270,10 @@ class ReviewHandler(BaseHTTPRequestHandler):
 class ReviewServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, db_path: Path, port: int = 8765):
+    def __init__(self, db_path: Path, port: int = 8765, runner: Runner | None = None):
         self.db_path = db_path
+        self.runner = runner or Runner(db_path, AgentSettings())
+        self.poller = batches.Poller(db_path, log=self.runner.log)
         super().__init__(("127.0.0.1", port), ReviewHandler)
 
     @property
@@ -188,10 +281,35 @@ class ReviewServer(ThreadingHTTPServer):
         return f"http://127.0.0.1:{self.server_address[1]}/"
 
 
-def serve(db_path: Path, port: int, open_browser: bool) -> None:
-    store.connect(db_path).close()
-    server = ReviewServer(db_path, port)
-    print(f"Task review page: {server.url}  (Ctrl+C to stop)")
+def _safe_check(server: "ReviewServer") -> None:
+    try:
+        server.poller.check_now()
+    except Exception as exc:
+        print_log(f"Checking batches failed: {exc}")
+
+
+def serve(db_path: Path, port: int, open_browser: bool, settings: AgentSettings | None = None, parallel: int = 2) -> None:
+    conn = store.connect(db_path)
+    try:
+        if interrupted := store.fail_interrupted_runs(conn):
+            print(f"Marked {interrupted} interrupted investigation(s) as failed; they can be sent to Claude again.",
+                  flush=True)
+    finally:
+        conn.close()
+    server = ReviewServer(db_path, port, Runner(db_path, settings or AgentSettings(), parallel))
+    print(f"Task review page: {server.url}  (Ctrl+C to stop)", flush=True)
+    print(f"Tasks sent to Claude run {server.runner.parallel} at a time using {server.runner.status()['runner']}.",
+          flush=True)
+    server.poller.start()
+    conn = store.connect(db_path)
+    try:
+        open_batches = store.list_batches(conn, store.OPEN_BATCH_STATUSES)
+    finally:
+        conn.close()
+    if open_batches:
+        print(f"{len(open_batches)} Claude batch(es) still open; checking them every minute.", flush=True)
+        if credentials.get_api_key():
+            threading.Thread(target=lambda: _safe_check(server), daemon=True).start()
     if open_browser:
         webbrowser.open(server.url)
     try:

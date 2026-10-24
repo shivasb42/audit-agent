@@ -21,10 +21,13 @@ class TaskFilter:
     tests: str | None = None
     search: str | None = None
     app: str | None = None
+    kind: str | None = None
 
     def __post_init__(self) -> None:
         if self.status and self.status not in store.TASK_STATUSES:
             raise ValueError(f"unknown status {self.status!r}")
+        if self.kind and self.kind not in store.TASK_KINDS:
+            raise ValueError(f"kind must be one of {store.TASK_KINDS}")
         if self.tests and self.tests not in TEST_FILTERS:
             raise ValueError(f"tests must be one of {TEST_FILTERS}")
 
@@ -32,7 +35,12 @@ class TaskFilter:
 def _task_files(conn: sqlite3.Connection, audit_id: int) -> dict[int, list[str]]:
     files: dict[int, list[str]] = defaultdict(list)
     for row in conn.execute(
-        "SELECT task_id, path FROM audit_task_files WHERE audit_id = ? ORDER BY path", (audit_id,)
+        """SELECT task_id, path FROM audit_task_files WHERE audit_id = ?
+           UNION ALL
+           SELECT af.task_id, af.path FROM api_task_files af JOIN audit_tasks t ON t.id = af.task_id
+           WHERE t.audit_id = ? AND af.audit_id = t.audit_id
+           ORDER BY path""",
+        (audit_id, audit_id),
     ):
         files[row["task_id"]].append(row["path"])
     return files
@@ -50,11 +58,16 @@ def task_apps(conn: sqlite3.Connection, audit_id: int) -> dict[int, str | None]:
     ):
         if row["task_id"] not in best or row["n"] > best[row["task_id"]][0]:
             best[row["task_id"]] = (row["n"], row["app_root"])
-    return {task_id: root for task_id, (_, root) in best.items()}
+    apps = {task_id: root for task_id, (_, root) in best.items()}
+    for row in conn.execute("SELECT id, app_root FROM audit_tasks WHERE audit_id = ? AND kind = 'api'", (audit_id,)):
+        apps[row["id"]] = row["app_root"]
+    return apps
 
 
 def _matches(task: dict, files: list[str], f: TaskFilter) -> bool:
     if f.app and task["app_root"] != f.app:
+        return False
+    if f.kind and task["kind"] != f.kind:
         return False
     if f.status and task["status"] != f.status:
         return False
